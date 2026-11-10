@@ -21,3 +21,7 @@ datasets/*
 !datasets/sacre_coeur/
 
 /dataset/
+
+/.history/
+/datasets/
+/outputs/

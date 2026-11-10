@@ -1,0 +1,51 @@
+{
+  "schema_version": 3,
+  "image_dir": "datasets/images/DJI_20251221132525_0004_V",
+  "image_names": ["0_0.png", "1_0.png", "2_0.png", "3_0.png", "4_0.png", "5_0.png"],
+  "camera": {
+    "model": "PINHOLE",
+    "width": 3840,
+    "height": 2160,
+    "params": [2700.0, 2700.0, 1920.0, 1080.0],
+    "fixed": true
+  },
+  "dom_path": "datasets/maps/dom.tif",
+  "dsm_path": "datasets/maps/dsm.tif",
+  "native_sfm_dir": "outputs/original_pixsfm_20261108/sfm",
+  "native_dense_dir": "outputs/original_pixsfm_20261108/dense",
+  "initialization": "reuse_registered_sfm",
+  "frontend": {
+    "features_path": "outputs/original_pixsfm_20261108/keypoints.h5",
+    "adjusted_features_path": "outputs/original_pixsfm_20261108/sfm/refined_keypoints.h5",
+    "matches_path": "outputs/original_pixsfm_20261108/matches.h5"
+  },
+  "colmap_binary": "build/colmap_cuda/install_ptx90/bin/colmap",
+  "output_dir": "outputs/joint_map",
+  "map_association": {
+    "min_tracks": 12,
+    "matcher": "superglue",
+    "min_match_score": 0.2,
+    "homography_forward_threshold_dom_px": 3.0,
+    "dom_rotations_deg": [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330],
+    "dom_scales": [1, 2, 4],
+    "sim3_inlier_threshold_m": 2.0
+  },
+  "prior_validation": {
+    "required": true,
+    "candidate_information_scales": [0.1, 1.0, 10.0],
+    "holdout_fraction": 0.2,
+    "holdout_seed": 0,
+    "selected_model_path": "outputs/joint_map/shared/prior_model.json"
+  },
+  "dense": {"max_image_size": 2000},
+  "optimization": {"use_inner_iterations": false},
+  "update": {
+    "min_support_views": 3,
+    "min_triangulation_angle_deg": 1.0,
+    "max_reprojection_error_px": 2.0,
+    "max_relative_depth_error": 0.01,
+    "max_normal_angle_deg": 10.0,
+    "min_points_per_cell": 3,
+    "max_height_mad_m": 0.5
+  }
+}

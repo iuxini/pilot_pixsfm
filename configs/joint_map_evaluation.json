@@ -1,0 +1,15 @@
+{
+  "schema_version": 3,
+  "gt_pose_path": "datasets/poses/DJI_20251221132525_0004_V.txt",
+  "gt_depth_dir": "datasets/images/DJI_20251221132525_0004_V",
+  "depth_suffix": ".npy",
+  "depth_type": "camera_z_m",
+  "height_datum": "WGS84_ellipsoidal",
+  "reference_sampling": "all_valid_pixels",
+  "dsm_reference_region": "fixed_gt_domain_with_update_partitions",
+  "acceptance_dsm_region": "fixed_reference_domain",
+  "partition_metrics_role": "diagnostic",
+  "std_ddof": 0,
+  "valid_depth_rule": "finite_positive_six_pairs_v1",
+  "depth_rule_confirmation": "用户确认：valid_depth = np.isfinite(depth) & (depth > 0)。本批六份深度不再使用far进行额外过滤，也不删除最大深度值；后续仍按原方案处理反投影、地图范围和DSM有效性；此规则仅适用于这六组数据。"
+}
