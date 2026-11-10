@@ -1,4 +1,4 @@
-# 用途：调度地图重建、可靠性更新、地理导出及独立 GT 评价验收。
+# 用途：调度分阶段或完整地图流水线，核验交接并保留独立精度验收状态。
 import argparse
 import hashlib
 import importlib
@@ -13,6 +13,7 @@ from PIL import Image
 from joint_map.geometry import create_origin
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+PIPELINE_STAGES = [("check", None), ("baseline", None), ("initialize", None), ("validate_priors", None), ("register", None), ("joint", "joint"), ("dense", "baseline"), ("dense", "joint"), ("update", "baseline"), ("update", "joint"), ("export", "baseline"), ("export", "joint"), ("evaluate", None)]
 
 def write_json(path, data):
     """Write strict JSON with readable indentation and a trailing newline."""
@@ -105,6 +106,8 @@ def run_check(config_path):
     check_config(config)
     environment = check_environment()
     output_dir = PROJECT_ROOT / config["output_dir"]
+    if (output_dir/"evaluation/baseline_metrics.json").is_file():
+        raise ValueError("GT baseline is frozen; use --stage all to verify this experiment instead of rebuilding check")
     manifest_path = output_dir / "run_manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {"schema_version": 3, "stages": []}
     for record in manifest["stages"]:
@@ -131,14 +134,14 @@ def run_main():
     """Parse and execute the currently implemented pipeline stages."""
     parser = argparse.ArgumentParser(description="PixSfM map pipeline: input checks, registration and joint optimization")
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--stage", choices=["check", "baseline", "initialize", "validate_priors", "register", "joint", "dense", "update", "export", "evaluate"], required=True)
+    parser.add_argument("--stage", choices=["check", "baseline", "initialize", "validate_priors", "register", "joint", "dense", "update", "export", "evaluate", "all"], required=True)
     parser.add_argument("--branch", choices=["baseline", "joint"])
     parser.add_argument("--evaluation-config", type=Path)
     arguments = parser.parse_args()
     if (arguments.stage in ["dense", "update", "export"]) != (arguments.branch is not None):
         parser.error("--branch is required only for dense/update/export")
-    if (arguments.stage == "evaluate") != (arguments.evaluation_config is not None):
-        parser.error("--evaluation-config is required only for evaluate")
+    if (arguments.stage in ["evaluate", "all"]) != (arguments.evaluation_config is not None):
+        parser.error("--evaluation-config is required only for evaluate/all")
     config_path = (PROJECT_ROOT / arguments.config).resolve()
     if arguments.stage == "check":
         run_check(config_path)
@@ -146,6 +149,8 @@ def run_main():
         run_map_stage(config_path, arguments.stage, arguments.branch)
     elif arguments.stage == "evaluate":
         run_map_stage(config_path, arguments.stage, evaluation_config_path=(PROJECT_ROOT/arguments.evaluation_config).resolve())
+    elif arguments.stage == "all":
+        run_all(config_path, (PROJECT_ROOT/arguments.evaluation_config).resolve())
     else:
         run_map_stage(config_path, arguments.stage)
 
@@ -156,6 +161,8 @@ def run_map_stage(config_path, stage, branch=None, evaluation_config_path=None):
     check_config(config)
     check_environment()
     output_dir = PROJECT_ROOT / config["output_dir"]
+    if stage != "evaluate" and (output_dir/"evaluation/baseline_metrics.json").is_file():
+        raise ValueError("GT baseline is frozen; use --stage all for verification, not reconstruction-stage reruns")
     manifest_path = output_dir / "run_manifest.json"
     manifest = json.loads(manifest_path.read_text())
     required = {"baseline": "check", "initialize": "baseline", "validate_priors": "initialize", "register": "validate_priors", "joint": "register", "dense": "register" if branch == "baseline" else "joint", "update": "dense", "export": "update", "evaluate": "export"}[stage]
@@ -245,6 +252,187 @@ def run_map_stage(config_path, stage, branch=None, evaluation_config_path=None):
     print(f"{stage}: {report['status']} | images={report.get('registered_images')} | map_tracks={report.get('accepted_track_count', 0)}", flush=True)
     if report["status"] != "complete":
         raise RuntimeError(report["error"])
+
+def get_latest_stage(manifest, stage, branch):
+    """Return only the latest attempt for the exact stage and branch, preserving earlier failure history."""
+    records = [row for row in manifest["stages"] if row["stage"] == stage and row.get("branch") == branch]
+    return records[-1] if records else None
+
+def audit_pipeline(config_path, evaluation_config_path, output_dir):
+    """Verify all completed handoffs and current artifacts without rerunning reconstruction or GT scoring."""
+    from joint_map.joint import load_confirmed_handoff, get_formal_fingerprint
+    from joint_map.optimization import get_observations
+    from joint_map.export import read_geographic_cloud, read_geographic_poses
+    from joint_map.evaluation import compare_primary_metrics
+    config = json.loads(config_path.read_text())
+    manifest = json.loads((output_dir/"run_manifest.json").read_text())
+    verified = {}
+    def check_file(path, expected=None):
+        """Hash each artifact once and compare every recorded handoff digest against the same bytes."""
+        path = Path(path).resolve()
+        key = str(path)
+        if key not in verified:
+            verified[key] = get_file_fingerprint(path)["sha256"]
+        if expected is not None and verified[key] != expected:
+            raise ValueError("Pipeline artifact fingerprint changed: "+key)
+        return verified[key]
+    if manifest["config"]["sha256"] != check_file(config_path):
+        raise ValueError("Reconstruction configuration changed after input checking")
+    stages = []
+    for stage, branch in PIPELINE_STAGES:
+        row = get_latest_stage(manifest, stage, branch)
+        if row is None or row["status"] != "complete":
+            raise ValueError(f"Incomplete pipeline stage: {stage}/{branch}")
+        for path in row["artifacts"].values():
+            if not Path(path).exists():
+                raise FileNotFoundError(path)
+        stages.append({"stage": stage, "branch": branch, "status": row["status"], "counts": row["counts"]})
+    initial = json.loads((output_dir/"logs/check.log").read_text())
+    for saved in initial["input_fingerprints"].values():
+        if get_file_fingerprint(Path(saved["path"])) != saved:
+            raise ValueError("Original pipeline input changed: "+saved["path"])
+    if json.loads((output_dir/"shared/origin.json").read_text()) != initial["origin"]:
+        raise ValueError("Shared ENU origin changed after checking")
+    prior, registration, anchors, handoff = load_confirmed_handoff(output_dir)
+    joint = json.loads((output_dir/"joint/diagnostics.json").read_text())
+    if joint["status"] != "complete" or not joint["geometry"]["converged"] or not joint["feature"]["converged"] or not joint["final_factor_identity"]["passed"]:
+        raise ValueError("Joint solving or shared-parameter verification is incomplete")
+    branches = {}
+    with rasterio.open(PROJECT_ROOT/config["dsm_path"]) as source:
+        original, profile = source.read(1), source.profile
+    for branch in ["baseline", "joint"]:
+        model = pycolmap.Reconstruction(str(output_dir/branch/"model"))
+        if model.num_reg_images() != 6 or sorted(image.name for image in model.images.values()) != config["image_names"]:
+            raise ValueError("Branch camera identities are incomplete")
+        for camera in model.cameras.values():
+            if camera.model_name != config["camera"]["model"] or (camera.width, camera.height) != (config["camera"]["width"], config["camera"]["height"]):
+                raise ValueError("Branch camera calibration dimensions changed")
+            np.testing.assert_array_equal(camera.params, config["camera"]["params"])
+        dense = json.loads((output_dir/branch/"dense/summary.json").read_text())
+        update = json.loads((output_dir/branch/"map/summary.json").read_text())
+        export = json.loads((output_dir/branch/"export/summary.json").read_text())
+        if any(row["status"] != "complete" for row in [dense, update, export]):
+            raise ValueError("Branch dense/update/export execution is incomplete")
+        for name, digest in dense["source_model_sha256"].items():
+            check_file(output_dir/branch/"model"/name, digest)
+        for name, digest in dense["output_sha256"].items():
+            check_file(output_dir/branch/"dense"/name, digest)
+        check_file(output_dir/"shared/registration.json", dense["input_identity"]["registration_sha256"])
+        for name, digest in update["output_sha256"].items():
+            check_file(update["artifacts"][name], digest)
+        for path, digest in update["source_view_sha256"].items():
+            check_file(path, digest)
+        for name, digest in export["output_sha256"].items():
+            check_file(export["artifacts"][name], digest)
+        for path, digest in export["input_sha256"].items():
+            check_file(path, digest)
+        if len(dense["depth_maps"]) != 6 or any(row["valid_depth_pixels"] <= 0 for row in dense["depth_maps"]):
+            raise ValueError("Branch geometric depths are incomplete")
+        masks = {}
+        for name in ["coverage_mask", "overlap_mask", "reliability_mask", "update_mask"]:
+            with rasterio.open(output_dir/branch/"map"/(name+".tif")) as source:
+                if source.shape != original.shape or source.transform != profile["transform"] or source.crs != profile["crs"] or source.nodata != 255 or source.dtypes != ("uint8",):
+                    raise ValueError("Evidence mask metadata changed")
+                values = source.read(1)
+                if not np.isin(values, [0, 1]).all():
+                    raise ValueError("Evidence mask is not binary")
+                masks[name] = values.astype(bool)
+        selected = masks["update_mask"]
+        np.testing.assert_array_equal(selected, masks["coverage_mask"] & masks["overlap_mask"] & masks["reliability_mask"])
+        with rasterio.open(output_dir/branch/"map/updated_dsm.tif") as source:
+            if source.shape != original.shape or source.transform != profile["transform"] or source.crs != profile["crs"] or source.nodata != profile["nodata"] or source.dtypes != ("float32",):
+                raise ValueError("Updated DSM metadata changed")
+            np.testing.assert_array_equal(source.read(1)[~selected], original[~selected])
+        if int(selected.sum()) != update["updated_cell_count"] or (bool(selected.any()) != (update["update_status"] == "updated")):
+            raise ValueError("Actual update mask and update delivery status disagree")
+        if not selected.any() and update["updated_area_m2"] != 0:
+            raise ValueError("Empty update has nonzero area")
+        read_geographic_poses(output_dir/branch/"export/poses_wgs84.txt", config["image_names"])
+        for kind, expected in [("sparse", model.num_points3D()), ("dense", dense["dense_points"])]:
+            if len(read_geographic_cloud(output_dir/branch/"export"/(kind+"_wgs84.ply"))) != expected:
+                raise ValueError("Geographic point count differs from the branch source")
+        with np.load(update["artifacts"]["sparse_evidence"]) as lineage:
+            np.testing.assert_array_equal(lineage["shared_point_ids"], anchors["point_ids"])
+            np.testing.assert_array_equal(lineage["optimized_xyz_enu_m"], [model.points3D[int(index)].xyz for index in anchors["point_ids"]])
+            if lineage["dense_support_status"].item() != "checked" or len(lineage["dense_support_offsets"]) != len(anchors["point_ids"])+1:
+                raise ValueError("Sparse-to-dense evidence chain is incomplete")
+        if branch == "joint" and get_formal_fingerprint(model) != joint["serialization_check"]["persisted_model_fingerprint"]:
+            raise ValueError("Current joint model differs from the solved persisted model")
+        branches[branch] = {"registered_images": 6, "sparse_points": model.num_points3D(), "observations": len(get_observations(model)), "dense_points": dense["dense_points"], "update_status": update["update_status"], "updated_cell_count": update["updated_cell_count"], "updated_area_m2": update["updated_area_m2"]}
+    evaluation = json.loads((output_dir/"evaluation/report.json").read_text())
+    if evaluation["status"] != "complete" or str(evaluation_config_path) not in evaluation["input_sha256"]:
+        raise ValueError("Evaluation is incomplete or belongs to another evaluation configuration")
+    for path, digest in evaluation["input_sha256"].items():
+        check_file(path, digest)
+    for name, digest in evaluation["output_sha256"].items():
+        check_file(evaluation["artifacts"][name], digest)
+    reference = json.loads((output_dir/"evaluation/reference_manifest.json").read_text())
+    baseline = json.loads((output_dir/"evaluation/baseline_metrics.json").read_text())
+    check_file(output_dir/"evaluation/baseline_metrics.json", evaluation["baseline_metrics_sha256"])
+    for name, digest in baseline["artifact_sha256"].items():
+        check_file(output_dir/"evaluation"/name, digest)
+    for branch in ["baseline", "joint", "original"]:
+        errors = np.load(output_dir/"evaluation"/f"dsm_errors_{branch}.npy", mmap_mode="r")
+        if errors.shape != (evaluation["reference_count"],) or errors.dtype != np.float64:
+            raise ValueError("Full-domain error arrays changed shape or precision")
+    if reference["reference_count"] != evaluation["reference_count"] or reference["acceptance_reference_count"] != evaluation["acceptance_reference_count"]:
+        raise ValueError("Fixed reference cardinality differs between reports")
+    comparisons, passed = compare_primary_metrics(evaluation["baseline_metrics"], evaluation["joint_metrics"], evaluation["invalid_regression_count"])
+    if comparisons != evaluation["primary_comparisons"] or passed != evaluation["primary_acceptance_passed"]:
+        raise ValueError("Primary metric decisions disagree with acceptance status")
+    delivery = passed and all(row["update_status"] == "updated" for row in branches.values())
+    if delivery != evaluation["delivery_complete"] or manifest.get("accuracy_acceptance_passed") != passed or manifest.get("delivery_complete") != delivery:
+        raise ValueError("Execution, accuracy and delivery flags disagree")
+    documentation_sha = check_file(PROJECT_ROOT/"USAGE_JOINT_MAP.md")
+    integration_code_sha = check_file(Path(__file__))
+    return {"schema_version": 3, "status": "complete", "implementation_complete": True, "primary_acceptance_passed": passed, "delivery_complete": delivery, "accepted_map_priors": len(anchors["point_ids"]), "confirmed_map_weight": prior["lambda_map"], "user_confirmation": prior["user_confirmation"], "validation_run_dir": handoff["validation_run_dir"], "stages": stages, "branches": branches, "reference_count": evaluation["reference_count"], "acceptance_reference_count": evaluation["acceptance_reference_count"], "failed_primary_metrics": [key for key, row in evaluation["primary_comparisons"].items() if not row["passed"]], "documentation_sha256": documentation_sha, "integration_code_sha256": integration_code_sha, "verified_file_sha256": verified, "gt_scoring_performed_in_audit": False, "previous_failed_attempts_retained": sum(row["status"] == "failed" for row in manifest["stages"])}
+
+def run_all(config_path, evaluation_config_path):
+    """Resume the ordered pipeline, reuse completed stages and prohibit rebuilding a GT-frozen experiment."""
+    config = json.loads(config_path.read_text())
+    check_config(config)
+    check_environment()
+    output_dir = PROJECT_ROOT/config["output_dir"]
+    manifest_path = output_dir/"run_manifest.json"
+    log_path = output_dir/"logs/all.log"
+    report = {"schema_version": 3, "stage": "all", "status": "running", "error": None, "reused_stages": [], "executed_stages": []}
+    write_json(log_path, report)
+    for stage, branch in PIPELINE_STAGES:
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {"stages": []}
+        previous = get_latest_stage(manifest, stage, branch)
+        if previous is not None and previous["status"] == "complete":
+            report["reused_stages"].append({"stage": stage, "branch": branch})
+            continue
+        if stage != "evaluate" and (output_dir/"evaluation/baseline_metrics.json").exists():
+            report.update(status="failed", error=f"Frozen GT baseline forbids rebuilding {stage}/{branch}; preserve this experiment")
+            write_json(log_path, report)
+            raise ValueError(report["error"])
+        if stage == "register":
+            prior = json.loads((output_dir/"shared/prior_model.json").read_text())
+            if prior["status"] != "confirmed":
+                report.update(status="failed", error="Confirm an eligible prior candidate explicitly before register/joint; no weight is selected automatically")
+                write_json(log_path, report)
+                raise ValueError(report["error"])
+        if stage == "check":
+            run_check(config_path)
+        elif stage in ["dense", "update", "export"]:
+            run_map_stage(config_path, stage, branch)
+        elif stage == "evaluate":
+            run_map_stage(config_path, stage, evaluation_config_path=evaluation_config_path)
+        else:
+            run_map_stage(config_path, stage)
+        report["executed_stages"].append({"stage": stage, "branch": branch})
+        write_json(log_path, report)
+    audit = audit_pipeline(config_path, evaluation_config_path, output_dir)
+    report.update(audit, stage="all", error=None)
+    write_json(output_dir/"integration.json", report)
+    write_json(log_path, report)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["stages"].append({"stage": "all", "branch": None, "status": "complete", "artifacts": {"integration": str(output_dir/"integration.json"), "diagnostics": str(log_path)}, "counts": {"verified_stages": len(audit["stages"]), "verified_files": len(audit["verified_file_sha256"])}, "primary_acceptance_passed": audit["primary_acceptance_passed"], "delivery_complete": audit["delivery_complete"], "error": None})
+    manifest.update(status="complete", implementation_complete=True, accuracy_acceptance_passed=audit["primary_acceptance_passed"], delivery_complete=audit["delivery_complete"])
+    write_json(manifest_path, manifest)
+    print(f"all: complete | reused={len(report['reused_stages'])} | executed={len(report['executed_stages'])} | primary_acceptance={'passed' if audit['primary_acceptance_passed'] else 'failed'} | delivery_complete={audit['delivery_complete']}", flush=True)
+    return report
 
 if __name__ == "__main__":
     run_main()

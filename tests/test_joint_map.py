@@ -1904,5 +1904,136 @@ class TestGroundTruthEvaluation(unittest.TestCase):
             with patch("sys.argv", values), patch("sys.stderr"), self.assertRaises(SystemExit):
                 run_main()
 
+class TestPipelineIntegration(unittest.TestCase):
+    """Check safe stage reuse, explicit confirmation and immutable post-GT integration behavior."""
+    def create_fixture(self, root, stages):
+        """Create a minimal manifest for orchestrator tests without reading reconstruction or GT data."""
+        from run_joint_map import write_json
+        config = json.loads((PROJECT_ROOT/"configs/joint_map.json").read_text())
+        config["output_dir"] = "output"
+        write_json(root/"config.json", config)
+        out = root/"output"
+        rows = [{"stage": stage, "branch": branch, "status": "complete", "artifacts": {}, "counts": {}} for stage, branch in stages]
+        write_json(out/"run_manifest.json", {"stages": rows, "accuracy_acceptance_passed": False, "delivery_complete": False})
+        write_json(out/"shared/prior_model.json", {"status": "confirmed"})
+        return root/"config.json", out
+
+    def create_audit(self):
+        """Represent successful engineering checks while retaining the already failed scientific acceptance."""
+        from run_joint_map import PIPELINE_STAGES
+        return {"status": "complete", "implementation_complete": True, "primary_acceptance_passed": False, "delivery_complete": False, "stages": [{"stage": stage, "branch": branch} for stage, branch in PIPELINE_STAGES], "verified_file_sha256": {}}
+
+    def test_completed_pipeline_is_reused_without_changing_failed_acceptance(self):
+        """Do not run any stage again or promote failed primary acceptance during an integration audit."""
+        from unittest.mock import patch
+        from run_joint_map import run_all, PIPELINE_STAGES
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path, out = self.create_fixture(root, PIPELINE_STAGES)
+            evaluation_path = root/"evaluation_config_read_only_at_last_stage.json"
+            with patch("run_joint_map.PROJECT_ROOT", root), patch("run_joint_map.check_environment"), patch("run_joint_map.run_check") as check, patch("run_joint_map.run_map_stage") as stages, patch("run_joint_map.audit_pipeline", return_value=self.create_audit()):
+                result = run_all(config_path, evaluation_path)
+            check.assert_not_called()
+            stages.assert_not_called()
+            self.assertEqual(len(result["reused_stages"]), 13)
+            self.assertEqual(result["executed_stages"], [])
+            self.assertFalse(result["primary_acceptance_passed"])
+            self.assertFalse(result["delivery_complete"])
+            manifest = json.loads((out/"run_manifest.json").read_text())
+            self.assertTrue(manifest["implementation_complete"])
+            self.assertFalse(manifest["accuracy_acceptance_passed"])
+            self.assertFalse(manifest["delivery_complete"])
+
+    def test_frozen_baseline_and_latest_failure_block_rebuilding(self):
+        """Respect a failed latest attempt and preserve the frozen baseline instead of reusing older success."""
+        from unittest.mock import patch
+        from run_joint_map import run_all, PIPELINE_STAGES, write_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path, out = self.create_fixture(root, PIPELINE_STAGES)
+            manifest = json.loads((out/"run_manifest.json").read_text())
+            manifest["stages"].append({"stage": "joint", "branch": "joint", "status": "failed"})
+            write_json(out/"run_manifest.json", manifest)
+            write_json(out/"evaluation/baseline_metrics.json", {"frozen": True})
+            before = (out/"evaluation/baseline_metrics.json").read_bytes()
+            with patch("run_joint_map.PROJECT_ROOT", root), patch("run_joint_map.check_environment"), patch("run_joint_map.run_map_stage") as stages, self.assertRaises(ValueError):
+                run_all(config_path, root/"evaluation.json")
+            stages.assert_not_called()
+            self.assertEqual((out/"evaluation/baseline_metrics.json").read_bytes(), before)
+            report = json.loads((out/"logs/all.log").read_text())
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("Frozen GT baseline", report["error"])
+
+    def test_unconfirmed_prior_stops_without_registering_or_reading_gt(self):
+        """Require explicit user confirmation after validation without automatically selecting a weight."""
+        from unittest.mock import patch
+        from run_joint_map import run_all, PIPELINE_STAGES, write_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path, out = self.create_fixture(root, PIPELINE_STAGES[:4])
+            write_json(out/"shared/prior_model.json", {"status": "validated"})
+            evaluation_path = root/"must_not_be_opened.json"
+            with patch("run_joint_map.PROJECT_ROOT", root), patch("run_joint_map.check_environment"), patch("run_joint_map.run_map_stage") as stages, self.assertRaises(ValueError):
+                run_all(config_path, evaluation_path)
+            stages.assert_not_called()
+            self.assertFalse(evaluation_path.exists())
+            self.assertIn("Confirm an eligible prior", json.loads((out/"logs/all.log").read_text())["error"])
+
+    def test_individual_reconstruction_entries_preserve_frozen_baseline(self):
+        """Block direct reconstruction and check invocations before any manifest or source mutation."""
+        from unittest.mock import patch
+        from run_joint_map import run_check, run_map_stage, PIPELINE_STAGES, write_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path, out = self.create_fixture(root, PIPELINE_STAGES)
+            write_json(out/"evaluation/baseline_metrics.json", {"frozen": True})
+            before = (out/"run_manifest.json").read_bytes()
+            with patch("run_joint_map.PROJECT_ROOT", root), patch("run_joint_map.check_environment"), patch("run_joint_map.check_inputs") as inputs:
+                with self.assertRaises(ValueError):
+                    run_check(config_path)
+                with self.assertRaises(ValueError):
+                    run_map_stage(config_path, "joint")
+            inputs.assert_not_called()
+            self.assertEqual((out/"run_manifest.json").read_bytes(), before)
+
+    def test_pending_stages_run_in_order_with_evaluation_config_only_at_end(self):
+        """Pass only the evaluation path at the final step of an explicitly confirmed unfinished pipeline."""
+        from unittest.mock import patch
+        from run_joint_map import run_all, PIPELINE_STAGES, write_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path, out = self.create_fixture(root, PIPELINE_STAGES[:4])
+            evaluation_path = root/"not_read_by_orchestration.json"
+            calls = []
+            def run_stage(path, stage, branch=None, evaluation_config_path=None):
+                """Record simulated stage completion and enforce evaluation-input isolation."""
+                self.assertEqual(path, config_path)
+                if stage == "evaluate":
+                    self.assertEqual(evaluation_config_path, evaluation_path)
+                else:
+                    self.assertIsNone(evaluation_config_path)
+                actual_branch = "joint" if stage == "joint" else branch
+                calls.append((stage, actual_branch))
+                manifest = json.loads((out/"run_manifest.json").read_text())
+                manifest["stages"].append({"stage": stage, "branch": actual_branch, "status": "complete", "artifacts": {}, "counts": {}})
+                write_json(out/"run_manifest.json", manifest)
+            with patch("run_joint_map.PROJECT_ROOT", root), patch("run_joint_map.check_environment"), patch("run_joint_map.run_map_stage", side_effect=run_stage), patch("run_joint_map.audit_pipeline", return_value=self.create_audit()):
+                result = run_all(config_path, evaluation_path)
+            self.assertEqual(calls, PIPELINE_STAGES[4:])
+            self.assertEqual(len(result["executed_stages"]), 9)
+            self.assertFalse(evaluation_path.exists())
+
+    def test_all_cli_requires_only_its_explicit_evaluation_config(self):
+        """Expose all through the planned public entry and reject missing evaluation or branch arguments."""
+        from unittest.mock import patch
+        from run_joint_map import run_main
+        arguments = ["run_joint_map.py", "--config", "configs/joint_map.json", "--stage", "all", "--evaluation-config", "configs/joint_map_evaluation.json"]
+        with patch("sys.argv", arguments), patch("run_joint_map.run_all") as dispatch:
+            run_main()
+        dispatch.assert_called_once_with((PROJECT_ROOT/"configs/joint_map.json").resolve(), (PROJECT_ROOT/"configs/joint_map_evaluation.json").resolve())
+        for values in [arguments[:-2], arguments+["--branch", "joint"]]:
+            with patch("sys.argv", values), patch("sys.stderr"), self.assertRaises(SystemExit):
+                run_main()
+
 if __name__ == "__main__":
     unittest.main()
