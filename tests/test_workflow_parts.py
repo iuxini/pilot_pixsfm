@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from joint_map import workflow
 from run_improved import run_improved
-from evaluate_results import evaluate_results
+from evaluate_results import evaluate_results, resolve_evaluation_sources
 import test_joint_map
 
 class TestWorkflowParts(unittest.TestCase):
@@ -40,6 +40,97 @@ class TestWorkflowParts(unittest.TestCase):
     def fingerprint_source(self):
         """Fingerprint both producer directories to catch evaluator or optimizer writes through links."""
         return {str(path): workflow.get_sha256(path) for root in [self.original, self.improved] for path in root.rglob('*') if path.is_file()}
+
+    def create_legacy_run(self, container=None, name='run_saved'):
+        """Describe one complete old combined run without creating a modern batch record."""
+        container = self.batch/'legacy' if container is None else container
+        output = container/name
+        output.mkdir(parents=True)
+        for part in ['baseline', 'joint', 'shared']:
+            (output/part).symlink_to(self.original/part, target_is_directory=True)
+        config = json.loads((self.original/'reconstruction.json').read_text())
+        config['output_dir'] = str(output)
+        config['prior_validation']['selected_model_path'] = str(output/'shared/prior_model.json')
+        workflow.write_validation_json(output/'reconstruction.json', config)
+        workflow.write_validation_json(output/'localization_result.json', {'status': 'complete', 'output_dir': str(output)})
+        workflow.write_validation_json(output/'run_manifest.json', {'status': 'complete', 'config': {'sha256': workflow.get_sha256(output/'reconstruction.json')}, 'stages': [{'stage': 'export', 'branch': part, 'status': 'complete'} for part in ['baseline', 'joint']]})
+        return output
+
+    def test_legacy_run_and_unique_parent_score_without_batch_or_reconstruction(self):
+        """Evaluate the old layout through either supported path and preserve all producer files."""
+        legacy = self.create_legacy_run()
+        before = self.fingerprint_source()
+        for directory in [legacy.parent, legacy]:
+            with self.subTest(directory=directory):
+                sources = resolve_evaluation_sources(directory)
+                with patch.object(workflow, 'check_environment'), patch.object(workflow.subprocess, 'run', side_effect=AssertionError('Do not rerun old reconstruction')):
+                    result = evaluate_results(directory, self.gt_poses, self.gt_depth)
+                self.assertEqual(result['status'], 'complete')
+                self.assertEqual(result['input_layout'], 'legacy_combined')
+                self.assertEqual(result['source_run_dirs'], {'original': str(legacy), 'improved': str(legacy)})
+                report = json.loads(Path(result['report_json']).read_text())
+                self.assertEqual(report['reference_count'], 148)
+                self.assertEqual(len(report['primary_comparisons']), 8)
+                for path, digest in sources['source_sha256'].items():
+                    self.assertEqual(workflow.get_sha256(path), digest)
+        self.assertEqual(before, self.fingerprint_source())
+        self.assertFalse((legacy.parent/'batch.json').exists())
+        self.assertFalse((legacy/'batch.json').exists())
+
+    def test_multiple_legacy_runs_are_not_selected_automatically(self):
+        """Refuse an ambiguous container even if only one of its old runs is complete."""
+        legacy = self.create_legacy_run()
+        other = self.create_legacy_run(name='run_other')
+        workflow.write_validation_json(other/'localization_result.json', {'status': 'failed', 'output_dir': str(other)})
+        with self.assertRaisesRegex(ValueError, 'Multiple legacy runs'):
+            resolve_evaluation_sources(legacy.parent)
+
+    def test_incomplete_legacy_run_is_not_used(self):
+        """Reject an old partial run instead of treating a success marker as a replacement batch."""
+        legacy = self.create_legacy_run()
+        workflow.write_validation_json(legacy/'localization_result.json', {'status': 'running', 'output_dir': str(legacy)})
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            resolve_evaluation_sources(legacy.parent)
+
+    def test_legacy_latest_failed_export_is_rejected(self):
+        """Keep latest-stage failure checks even when an old top-level status says complete."""
+        legacy = self.create_legacy_run()
+        manifest = json.loads((legacy/'run_manifest.json').read_text())
+        manifest['stages'].append({'stage': 'export', 'branch': 'joint', 'status': 'failed'})
+        workflow.write_validation_json(legacy/'run_manifest.json', manifest)
+        with self.assertRaisesRegex(ValueError, 'both legacy branch exports'):
+            resolve_evaluation_sources(legacy)
+
+    def test_legacy_missing_branch_artifacts_are_rejected(self):
+        """Require the actual completed output summaries for both branches."""
+        legacy = self.create_legacy_run()
+        (legacy/'joint').unlink()
+        with self.assertRaisesRegex(ValueError, 'artifact is missing'):
+            resolve_evaluation_sources(legacy)
+
+    def test_legacy_changed_config_is_rejected(self):
+        """Retain the reconstruction configuration fingerprint when adapting old results."""
+        legacy = self.create_legacy_run()
+        config = json.loads((legacy/'reconstruction.json').read_text())
+        config['camera']['params'][0] += 1
+        workflow.write_validation_json(legacy/'reconstruction.json', config)
+        with self.assertRaisesRegex(ValueError, 'configuration changed'):
+            resolve_evaluation_sources(legacy)
+
+    def test_modern_batch_failure_never_falls_back_to_legacy(self):
+        """Give an existing current batch record priority over any old runs next to it."""
+        self.create_legacy_run(container=self.batch)
+        self.state['original'].pop('result_sha256')
+        workflow.write_validation_json(self.batch/'batch.json', self.state)
+        with self.assertRaisesRegex(ValueError, 'original successfully'):
+            resolve_evaluation_sources(self.batch)
+
+    def test_missing_all_result_layouts_has_a_clear_error(self):
+        """Explain the missing result layout without silently picking another dataset."""
+        directory = self.batch/'empty'
+        directory.mkdir()
+        with self.assertRaisesRegex(FileNotFoundError, 'No batch.json or legacy'):
+            resolve_evaluation_sources(directory)
 
     def test_evaluation_scores_all_metrics_without_reconstruction_or_input_writes(self):
         """Run real evaluation on all valid fixture pixels and leave both producer outputs unchanged."""
