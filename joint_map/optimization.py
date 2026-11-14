@@ -24,7 +24,7 @@ from pixsfm.features.models import s2dnet
 from PIL import Image
 import torch
 from joint_map.geometry import convert_pixels_to_geodetic, convert_geodetic_to_enu
-from joint_map.registration import apply_sim3, check_track_geometry, estimate_sim3, screen_homography, select_map_candidates, write_initialized_model
+from joint_map.registration import apply_sim3, check_camera_connectivity, check_initialized_model, check_track_geometry, estimate_sim3, filter_common_registration, screen_homography, select_map_candidates, write_initialized_model
 
 class RecordSolverIterations(pyceres.IterationCallback):
     """Observe native Ceres iteration summaries without changing solver decisions or parameters."""
@@ -70,7 +70,7 @@ def create_holdout(model, fraction, seed):
     """Remove one observation from a seeded fraction of tracks having at least three views."""
     training = copy.deepcopy(model)
     observations = get_observations(model)
-    eligible = sorted(point_id for point_id, point in model.points3D.items() if len(point.track.elements) >= 3)
+    eligible = sorted(point_id for point_id, point in model.points3D.items() if len({entry.image_id for entry in point.track.elements}) >= 3)
     rng = np.random.default_rng(seed)
     selected = rng.choice(eligible, size=int(np.floor(len(eligible) * fraction)), replace=False)
     heldout = []
@@ -81,14 +81,76 @@ def create_holdout(model, fraction, seed):
         training.delete_observation(entry.image_id, entry.point2D_idx)
     if not heldout or set(training.points3D) != set(model.points3D):
         raise ValueError("Holdout requires nonempty evaluation and at least two training views per affected track")
+    check_holdout_partition(model, training, heldout, fraction)
     return training, heldout
+
+def check_holdout_partition(model, training, heldout, fraction):
+    """Verify the data-derived split, exact coverage and reciprocal isolation without historical counts."""
+    all_rows, train_rows = get_observations(model), get_observations(training)
+    all_table, train_table, held_table = [{row[:3]: row[3] for row in rows} for rows in [all_rows, train_rows, heldout]]
+    if any(len(table) != len(rows) for table, rows in [(all_table, all_rows), (train_table, train_rows), (held_table, heldout)]):
+        raise ValueError("Observation identities must be unique in every partition")
+    eligible = {point_id for point_id, point in model.points3D.items() if len({entry.image_id for entry in point.track.elements}) >= 3}
+    expected = int(np.floor(len(eligible)*fraction))
+    if not heldout or len(heldout) != expected or len({row[0] for row in heldout}) != expected or any(row[0] not in eligible for row in heldout):
+        raise ValueError("Holdout count or track eligibility differs from the configured split rule")
+    if set(train_table) & set(held_table) or set(train_table) | set(held_table) != set(all_table):
+        raise ValueError("Training and holdout must be disjoint and cover every original observation")
+    if set(model.points3D) != set(training.points3D) or set(model.images) != set(training.images) or set(model.cameras) != set(training.cameras):
+        raise ValueError("Holdout changed shared point, image or camera identities")
+    source_state, train_state = get_model_fingerprint(model), get_model_fingerprint(training)
+    if any(source_state[key] != train_state[key] for key in ["poses", "points", "cameras"]):
+        raise ValueError("Holdout changed visual geometry or fixed calibration")
+    source_points = {image_id: image.points2D for image_id, image in model.images.items()}
+    training_points = {image_id: image.points2D for image_id, image in training.images.items()}
+    for identity, pixel in all_table.items():
+        point_id, image_id, feature_id = identity
+        original = source_points[image_id][feature_id]
+        current = training_points[image_id][feature_id]
+        actual = held_table[identity] if identity in held_table else train_table[identity]
+        if np.asarray(pixel).shape != (2,) or not np.isfinite(pixel).all() or not np.array_equal(pixel, actual) or not np.array_equal(pixel, current.xy):
+            raise ValueError("Partition changed or invalidated measured image coordinates")
+        if original.point3D_id != point_id or (identity in held_table and current.has_point3D()) or (identity in train_table and current.point3D_id != point_id):
+            raise ValueError("Training or holdout graph contains a nonreciprocal image association")
+    for point_id, point in training.points3D.items():
+        image_ids = [entry.image_id for entry in point.track.elements]
+        if len(set(image_ids)) < 2:
+            raise ValueError("Every training track must retain at least two distinct image views")
+    return {"passed": True, "original_observation_count": len(all_rows), "eligible_track_count": len(eligible), "training_observation_count": len(train_rows), "heldout_observation_count": len(heldout), "expected_heldout_observation_count": expected, "overlap_count": 0, "training_observations_sha256": get_observation_digest(train_rows), "holdout_observations_sha256": get_observation_digest(heldout), "reciprocal_graph_checked": True}
+
+def read_module2_map_links(output_dir):
+    """Verify the module-two frozen collection before revalidating any training-only map evidence."""
+    registration = json.loads((output_dir/"shared/registration.json").read_text())
+    path = output_dir/"shared/track_map_links.npz"
+    if registration["status"] != "provisional" or registration["map_collection_scope"] != "module2_common_frozen" or get_sha256(path) != registration["track_map_links_sha256"]:
+        raise ValueError("Module two map collection or frozen link digest changed")
+    with np.load(path) as archive:
+        links = {key: archive[key] for key in archive.files}
+    selected = np.flatnonzero(links["selected_for_prior"])
+    selected = selected[np.argsort(links["prior_ids"][selected])]
+    if selected.tolist() != registration["selected_link_indices"] or links["track_ids"][selected].tolist() != registration["inlier_point3D_ids"] or not np.array_equal(links["prior_ids"][selected], np.arange(len(selected))) or links["common_rejected"][selected].any() or not links["accepted"][selected].all():
+        raise ValueError("Module two frozen prior identities differ from their registration")
+    return links, registration
+
+def check_training_priors(model, anchors, min_tracks):
+    """Validate finite unique map means on the connected current training graph."""
+    ids, means = np.asarray(anchors["point_ids"]), np.asarray(anchors["means"])
+    if ids.ndim != 1 or len(ids) < min_tracks or len(set(ids)) != len(ids) or any(int(point_id) not in model.points3D for point_id in ids):
+        raise ValueError("Training priors require enough unique shared points from the training model")
+    if means.shape != (len(ids), 3) or not np.isfinite(means).all():
+        raise ValueError("Training prior means must be finite XYZ values")
+    reached, connected = check_camera_connectivity(model, ids)
+    if not connected:
+        raise ValueError("Training map priors do not connect every registered image")
+    return {"passed": True, "map_prior_count": len(ids), "point_ids_sha256": get_array_digest(ids), "means_sha256": get_array_digest(means), "connected_image_ids": reached}
 
 def create_training_links(config, root, output_dir, model, heldout):
     """Exclude heldout map votes and recompute planar and 3D selection on training observations."""
-    with np.load(output_dir / "shared/track_map_links.npz") as archive:
-        links = {key: archive[key] for key in archive.files}
+    links, registration = read_module2_map_links(output_dir)
     pairs = {(image_id, feature_id) for point_id, image_id, feature_id, xy in heldout}
-    keep = np.array([(int(image_id), int(feature_id)) not in pairs for image_id, feature_id in zip(links["image_ids"], links["feature_ids"])])
+    holdout_keep = np.array([(int(image_id), int(feature_id)) not in pairs for image_id, feature_id in zip(links["image_ids"], links["feature_ids"])])
+    pool_keep = np.isin(links["track_ids"], registration["inlier_point3D_ids"]) & ~links["common_rejected"]
+    keep = holdout_keep & pool_keep
     original_indices = np.flatnonzero(keep)
     links = {key: values[keep] for key, values in links.items()}
     observations = {image_id: image.points2D for image_id, image in model.images.items()}
@@ -110,9 +172,12 @@ def create_training_links(config, root, output_dir, model, heldout):
                 links["homography_pass"][indices] = errors <= config["map_association"]["homography_forward_threshold_dom_px"]
     source = np.array([model.points3D[int(track_id)].xyz if track_id >= 0 else np.full(3, np.nan) for track_id in links["track_ids"]])
     accepted, codes, errors, reference_counts, selected, evidence = select_map_candidates(links, source, config["map_association"]["sim3_inlier_threshold_m"])
-    if len(selected) < config["map_association"]["min_tracks"]:
-        raise ValueError("Insufficient independently verified training-only map associations")
-    return {"point_ids": links["track_ids"][selected], "means": links["means_enu_m"][selected], "dom_pixels": links["dom_pixels"][selected], "map_feature_ids": links["dom_feature_ids"][selected], "selected_link_indices": original_indices[selected], "source_prior_ids": links["prior_ids"][selected], "excluded_map_votes": int((~keep).sum()), "independent_models": evidence}
+    transform, selected, common = filter_common_registration(links, source, selected, config["map_association"]["sim3_inlier_threshold_m"], config["map_association"]["min_tracks"])
+    if transform is None:
+        raise ValueError("Training-only common map validation failed: "+common["error"])
+    anchors = {"point_ids": links["track_ids"][selected], "means": links["means_enu_m"][selected], "dom_pixels": links["dom_pixels"][selected], "map_feature_ids": links["dom_feature_ids"][selected], "selected_link_indices": original_indices[selected], "source_prior_ids": links["prior_ids"][selected], "excluded_map_votes": int((~holdout_keep).sum()), "excluded_module2_pool_votes": int((~pool_keep).sum()), "independent_models": evidence, "common_validation": common, "module2_links_sha256": registration["track_map_links_sha256"]}
+    check_training_priors(model, anchors, config["map_association"]["min_tracks"])
+    return anchors
 
 def compute_robust_scale(values, floor):
     """Estimate a MAD working scale with an explicit numeric or quantization floor."""
@@ -195,8 +260,10 @@ def check_dense_cache(path, provenance):
             summaries[name] = {"shape": list(dataset.shape), "dtype": str(dataset.dtype), "scale": scale.tolist(), "original_size": expected["original_size"], "content_sha256": digest.hexdigest(), "raw_bytes": int(dataset.size * dataset.dtype.itemsize)}
     return summaries
 
-def prepare_dense_holdout_cache(config, root, path):
+def prepare_dense_holdout_cache(config, root):
     """Extract six whole S2DNet maps sequentially, or reuse only a complete matching cache."""
+    path = root/config["output_dir"]/"shared/holdout_dense_features.h5"
+    path.parent.mkdir(parents=True, exist_ok=True)
     provenance = get_dense_provenance(config, root)
     required = sum(int(np.prod(item["feature_shape"])) * 2 for item in provenance["images"].values())
     available_memory = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:"))
@@ -971,7 +1038,7 @@ def audit_factor_identity(state):
 
 def get_derivative_policy():
     """Return the fixed multiscale reference policy independently of any analytic derivative."""
-    return {"version": "multiscale_richardson_roundguard_v1", "rotation_h0": 1e-6, "translation_xyz_h0_m": 1e-4, "level_indices": list(range(7)), "step_ratio": 0.5, "window_indices": [2, 3, 4, 5], "channels": 128, "shared_window": True, "reference_function": "native descriptor before frozen reference subtraction", "epsilon": 2.220446049250313e-16, "rounding_coefficient": 8., "representation_rtol": 1e-6, "comparison_atol": 1e-5, "comparison_rtol": 1e-4, "stability_fraction": 0.1, "error": "E_diff+E_round; estimate, not a strict bound", "selection": "first common stable same-cell window; no analytic input"}
+    return {"version": "multiscale_richardson_roundguard_v2", "rotation_h0": 1e-6, "translation_xyz_h0_m": 1e-4, "initial_level_count": 7, "max_level_count": 11, "level_indices": list(range(11)), "step_ratio": 0.5, "initial_window_indices": [2, 3, 4, 5], "window_indices": list(range(2, 10)), "extension_trigger": "no window solely because of cross_segment", "extension_stop": "ready, another unresolved reason, or 11 levels", "channels": 128, "shared_window": True, "reference_function": "native descriptor before frozen reference subtraction", "epsilon": 2.220446049250313e-16, "rounding_coefficient": 8., "representation_rtol": 1e-6, "comparison_atol": 1e-5, "comparison_rtol": 1e-4, "stability_fraction": 0.1, "error": "E_diff+E_round; estimate, not a strict bound", "selection": "first common stable same-cell window; no analytic input"}
 
 def check_actual_perturbation(original, negative, positive, block_index, axis, step):
     """Check actual buffer displacements and native quaternion chord lengths before sampling."""
@@ -998,8 +1065,8 @@ def check_actual_perturbation(original, negative, positive, block_index, axis, s
 def select_multiscale_reference(center, levels):
     """Select the first shared numerical window using only samples and rounding estimates."""
     center = np.asarray(center, dtype=np.float64)
-    if center.shape != (128,) or len(levels) != 7 or not np.isfinite(center).all():
-        raise ValueError("Multiscale reference requires seven levels and 128 finite center values")
+    if center.shape != (128,) or not 7 <= len(levels) <= 11 or not np.isfinite(center).all():
+        raise ValueError("Multiscale reference requires seven to eleven levels and 128 finite center values")
     epsilon = 2.220446049250313e-16
     rows, extrapolations, windows = [], [], []
     for index, level in enumerate(levels):
@@ -1018,7 +1085,7 @@ def select_multiscale_reference(center, levels):
                 else:
                     row.update(D=derivative.tolist(), magnitude=magnitude.tolist(), rounding_floor_minus=rounding.tolist(), rounding_floor_plus=rounding.tolist(), B_D=bound.tolist())
         rows.append(row)
-    for index in range(6):
+    for index in range(len(levels)-1):
         row = {"k": index, "valid": False, "R": None, "B_R": None}
         if rows[index]["valid"] and rows[index+1]["valid"]:
             value = (4*np.asarray(rows[index+1]["D"])-np.asarray(rows[index]["D"]))/3
@@ -1026,9 +1093,9 @@ def select_multiscale_reference(center, levels):
             if np.isfinite(value).all() and np.isfinite(bound).all():
                 row.update(valid=True, R=value.tolist(), B_R=bound.tolist())
         extrapolations.append(row)
-    result = {"strategy": "multiscale_richardson_roundguard_v1", "status": "inconclusive", "selected_window": None, "reference": None, "error": None, "center_values": center.tolist(), "levels": rows, "extrapolations": extrapolations, "windows": windows}
+    result = {"strategy": "multiscale_richardson_roundguard_v2", "status": "inconclusive", "selected_window": None, "reference": None, "error": None, "center_values": center.tolist(), "levels": rows, "extrapolations": extrapolations, "windows": windows}
     reasons = []
-    for j in [2, 3, 4, 5]:
+    for j in range(2, len(levels)-1):
         raw = rows[j-2:j+2]
         window = {"j": j, "eligible": False, "accepted": False}
         if not all(row["valid"] for row in raw):
@@ -1077,7 +1144,7 @@ def classify_multiscale_derivative(numerical, analytic):
     return {"status": status, "analytic": analytic.tolist(), "difference": difference.tolist(), "tolerance": tolerance.tolist(), "channels": statuses.tolist(), "reason": None if status == "passed" else "analytic_comparison"}
 
 def verify_multiscale_direction(feature, blocks, block_index, axis, manifold, interpolation):
-    """Sample all fixed scales safely and read the analytic derivative only after window selection."""
+    """Extend only cross-cell unresolved windows and read analytic derivatives after selection."""
     patch = feature.patch
     nodes = np.asarray(interpolation.nodes, dtype=np.float64)
     pixel, reason = get_candidate_projection(blocks)
@@ -1088,8 +1155,8 @@ def verify_multiscale_direction(feature, blocks, block_index, axis, manifold, in
     center = feature.native.evaluate(*blocks)[0]
     if center is None or not np.isfinite(center).all():
         return {"status": "inconclusive", "reason": "nonfinite_center_descriptor", "identity": list(feature.identity), "comparison": None}
-    levels = []
-    for k in range(7):
+    levels, extension_trigger = [], None
+    for k in range(11):
         step = (1e-6 if block_index == 0 else 1e-4)/(2**k)
         pair = []
         for sign in [-1, 1]:
@@ -1122,7 +1189,13 @@ def verify_multiscale_direction(feature, blocks, block_index, axis, manifold, in
             if row["valid"]:
                 row.update(values_minus=samples[0].tolist(), values_plus=samples[1].tolist(), cells_minus=cells[0].tolist(), cells_plus=cells[1].tolist(), same_segment=bool(np.array_equal(cells[0], center_cells) and np.array_equal(cells[1], center_cells)))
         levels.append(row)
-    numerical = select_multiscale_reference(center.reshape(-1), levels)
+        if len(levels) >= 7:
+            numerical = select_multiscale_reference(center.reshape(-1), levels)
+            if numerical["status"] == "ready" or numerical["reason"] != ["cross_segment"]:
+                break
+            if len(levels) == 7:
+                extension_trigger = {"initial_level_count": 7, "initial_status": numerical["status"], "initial_reason": numerical["reason"]}
+    numerical.update(level_count=len(levels), extended=len(levels) > 7, extension_trigger=extension_trigger)
     result = {"identity": list(feature.identity), "block_index": block_index, "axis": axis.tolist(), "center_parameters": [block.tolist() for block in blocks], "center_cells": center_cells.tolist(), "numerical": numerical, "comparison": None}
     if numerical["status"] != "ready":
         result.update(status="inconclusive", reason=numerical["reason"])
@@ -1220,6 +1293,9 @@ def audit_native_equivalence(model, anchors, scales, context, patch_path):
 def write_map_priors(model, anchors, scales, path):
     """Write one finite covariance and complete observation lineage for each accepted track."""
     ids = np.asarray(anchors["point_ids"], dtype=np.int64)
+    check_training_priors(model, anchors, 1)
+    if not all(np.isfinite(scales[key]) and scales[key] > 0 for key in ["sigma_horizontal_m", "sigma_height_m"]):
+        raise ValueError("Frozen prior covariance requires finite positive horizontal and height scales")
     image_ids, feature_ids, prior_indices = [], [], []
     for index, point_id in enumerate(ids):
         for entry in model.points3D[int(point_id)].track.elements:
@@ -1409,6 +1485,8 @@ def run_prior_validation_in_process(config, root, output_dir, write_json):
         raise ValueError("Initialization must be complete before prior validation")
     if config["prior_validation"]["candidate_information_scales"] != [0.1, 1., 10.]:
         raise ValueError("Candidate weights differ from the frozen development plan")
+    if config["prior_validation"]["holdout_fraction"] != 0.2 or config["prior_validation"]["holdout_seed"] != 0:
+        raise ValueError("Holdout fraction and seed differ from the planned 0.2/0 rule")
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir = shared/"candidates"/run_id
     run_dir.mkdir(parents=True)
@@ -1417,29 +1495,33 @@ def run_prior_validation_in_process(config, root, output_dir, write_json):
         if (shared/name).exists():
             shutil.copy2(shared/name, run_dir/("previous_"+name))
     model = pycolmap.Reconstruction(str(output_dir/"joint/model"))
+    _, registration = read_module2_map_links(output_dir)
+    native = pycolmap.Reconstruction(str(root/config["native_sfm_dir"]))
+    transform = (registration["scale"], np.asarray(registration["rotation"]), np.asarray(registration["translation_enu_m"]))
+    module2_geometry = check_initialized_model(native, model, transform)
+    shutil.copy2(shared/"registration.json", run_dir/"module2_registration.json")
     training, heldout = create_holdout(model, config["prior_validation"]["holdout_fraction"], config["prior_validation"]["holdout_seed"])
     report = {"schema_version": 3, "stage": "validate_priors", "run_id": run_id, "run_dir": str(run_dir), "status": "running", "error": None, "registered_images": model.num_reg_images(), "sparse_points": model.num_points3D(), "initialization_uses_heldout": True, "interpretation": "conditional holdout stability and sensitivity; not independent generalization or absolute accuracy", "gt_inputs_read": False, "training_observation_count": len(get_observations(training)), "heldout_observation_count": len(heldout), "training_observations_sha256": get_observation_digest(get_observations(training)), "holdout_observations_sha256": get_observation_digest(heldout), "heldout_observations": [list(row[:3]) for row in heldout], "visual_reference_model_fingerprint": get_model_fingerprint(training), "prior_status": "unvalidated", "candidates": [{"candidate_id": label, "information_scale": weight, "status": "pending"} for label, weight in [("weight_0p1", 0.1), ("weight_1p0", 1.), ("weight_10p0", 10.)]]}
     write_json(report_path, report)
     write_json(shared/"prior_model.json", {"schema_version": 3, "status": "unvalidated", "lambda_map": None, "candidate_id": None})
     print(f"Validation {run_id}: training={report['training_observation_count']}, heldout={len(heldout)}", flush=True)
     available_memory = next(int(line.split()[1])*1024 for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:"))
-    report["resources"] = {"memory_available_bytes": available_memory, "disk_free_bytes": shutil.disk_usage(shared).free, "device": "CPU Ceres and immutable float16 cache; no network inference"}
+    report["resources"] = {"memory_available_bytes": available_memory, "disk_free_bytes": shutil.disk_usage(shared).free, "device": "GPU cache preparation when missing; CPU Ceres with immutable float16 cache"}
     if available_memory < 8*1024**3 or report["resources"]["disk_free_bytes"] < 512*1024**2:
         raise RuntimeError("Insufficient resources for approved full-resolution validation")
-    if len(heldout) != 777 or report["training_observation_count"] != 18013:
-        raise ValueError("The fixed 777/18013 observation split changed")
+    report["partition_checks"] = check_holdout_partition(model, training, heldout, config["prior_validation"]["holdout_fraction"])
+    report["holdout_policy"] = {"fraction_of_eligible_tracks": 0.2, "seed": 0, "minimum_original_views": 3, "observations_per_selected_track": 1}
+    report["module2_handoff"] = {"geometry": module2_geometry, "frozen_track_count": len(registration["inlier_point3D_ids"]), "track_map_links_sha256": registration["track_map_links_sha256"], "registration_snapshot": str(run_dir/"module2_registration.json")}
     dense_path = shared/"holdout_dense_features.h5"
-    if not dense_path.exists():
-        raise FileNotFoundError("Approved dense cache is missing; automatic extraction is forbidden")
     patch_path = (root/config["native_sfm_dir"]/"../dense_features.h5").resolve()
-    report["holdout_dense_cache"] = {"path": str(dense_path), "sha256": get_sha256(dense_path), "provenance": get_dense_provenance(config, root)}
-    report["holdout_dense_cache"]["images"] = check_dense_cache(dense_path, report["holdout_dense_cache"]["provenance"])
+    report["holdout_dense_cache"] = prepare_dense_holdout_cache(config, root)
+    report["holdout_dense_cache"]["sha256"] = get_sha256(dense_path)
     report["cache_consistency"] = compare_dense_and_patch_cache(dense_path, patch_path, InterpolationConfig(interpolation_default_conf))
     report["cache_usage"] = "same immutable full-image storage for training and evaluation; heldout observations excluded from all fitting"
     write_json(report_path, report)
     anchors = create_training_links(config, root, output_dir, training, heldout)
-    if len(anchors["point_ids"]) != 942:
-        raise ValueError("The frozen training map collection differs from the planned 942 anchors")
+    report["training_map_checks"] = check_training_priors(training, anchors, config["map_association"]["min_tracks"])
+    report["training_map_checks"].update(excluded_module2_pool_votes=anchors["excluded_module2_pool_votes"], common_validation=anchors["common_validation"])
     order = np.argsort(anchors["point_ids"])
     for key in ["point_ids", "means", "dom_pixels", "map_feature_ids", "selected_link_indices", "source_prior_ids"]:
         anchors[key] = anchors[key][order]
@@ -1496,8 +1578,8 @@ def run_prior_validation_in_process(config, root, output_dir, write_json):
     for name in ["map_priors.npz", "training_references.npz"]:
         shutil.copy2(shared/name, run_dir/name)
     np.savez_compressed(run_dir/"heldout.npz", identities=np.array([row[:3] for row in heldout], dtype=np.int64), pixels=np.array([row[3] for row in heldout]))
-    frozen_paths = [run_dir/name for name in ["map_priors.npz", "training_references.npz", "heldout.npz"]]+[run_dir/"training_visual_model"/name for name in ["cameras.bin", "images.bin", "points3D.bin"]]+[Path(__file__), Path(pyceres.__file__), dense_path, patch_path, shared/"track_map_links.npz", shared/"map_priors.npz", root/"PROJECT_PLAN.md"]
-    metadata = {"run_id": run_id, "policy_sha256": policy_sha, "policy": report["policy"], "scales": scales, "base_gauge": report["base_gauge"], "dense_path": str(dense_path), "heldout_count": len(heldout), "frozen_files": {str(path.resolve()): get_sha256(path) for path in frozen_paths}}
+    frozen_paths = [run_dir/name for name in ["map_priors.npz", "training_references.npz", "heldout.npz", "module2_registration.json"]]+[run_dir/"training_visual_model"/name for name in ["cameras.bin", "images.bin", "points3D.bin"]]+[Path(__file__), root/"joint_map/registration.py", Path(pyceres.__file__), dense_path, patch_path, shared/"track_map_links.npz", shared/"map_priors.npz", root/"PROJECT_PLAN.md"]
+    metadata = {"run_id": run_id, "policy_sha256": policy_sha, "policy": report["policy"], "scales": scales, "base_gauge": report["base_gauge"], "dense_path": str(dense_path), "heldout_count": len(heldout), "partition_checks": report["partition_checks"], "holdout_policy": report["holdout_policy"], "map_prior_count": len(anchors["point_ids"]), "module2_handoff": report["module2_handoff"], "frozen_files": {str(path.resolve()): get_sha256(path) for path in frozen_paths}}
     write_json(run_dir/"run.json", metadata)
     write_json(run_dir/"validation_snapshot.json", report)
     write_json(report_path, report)

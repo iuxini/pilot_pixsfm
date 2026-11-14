@@ -53,8 +53,12 @@ def check_registered_visual_model(visual, native, registration):
         point.xyz = apply_sim3(point.xyz, transform)
     names = [(index, image.name, image.camera_id) for index, image in sorted(visual.images.items())]
     expected_names = [(index, image.name, image.camera_id) for index, image in sorted(expected.images.items())]
-    if names != expected_names or get_formal_fingerprint(visual) != get_formal_fingerprint(expected):
+    if names != expected_names:
         raise ValueError("Registered visual model changed geometry, calibration or observation identities")
+    check_serialized_model(expected, visual)
+    initialization = registration.get("joint_map_initialization")
+    if initialization is not None and get_model_fingerprint(expected)["poses"] != initialization["lineage"]["model_fingerprint"]["poses"]:
+        raise ValueError("Registered initialization pose fingerprint differs from the original transform")
     for camera_id, camera in visual.cameras.items():
         original = native.cameras[camera_id]
         if (camera.model_id, camera.width, camera.height) != (original.model_id, original.width, original.height):
@@ -72,6 +76,9 @@ def load_confirmed_handoff(output_dir):
     selected = [row for row in validation["candidates"] if row["candidate_id"] == prior["candidate_id"] and row["status"] == "passed" and row["information_scale"] == prior["lambda_map"]]
     if validation["status"] != "complete" or len(selected) != 1 or validation["policy_sha256"] != prior["policy_sha256"]:
         raise ValueError("Confirmed candidate does not match completed validation")
+    scale_keys = ["sigma_horizontal_m", "sigma_height_m", "sigma_pixel_px", "sigma_feature_norm", "lambda_feature"]
+    if any(not np.isfinite(prior[key]) or prior[key] <= 0 or prior[key] != validation["scales"][key] for key in scale_keys) or prior["robust_loss"] != validation["scales"]["robust_loss"]:
+        raise ValueError("Confirmed scales or robust loss differ from frozen module-three validation")
     read_frozen_candidate_inputs(Path(validation["run_dir"]))
     registration = json.loads((shared/"registration.json").read_text())
     if registration["status"] != "confirmed" or not registration["priors_confirmed"] or registration["prior_model"] != prior:
@@ -82,17 +89,45 @@ def load_confirmed_handoff(output_dir):
         anchors = {"point_ids": archive["shared_point_ids"].copy(), "means": archive["means_enu_m"].copy(), "prior_ids": archive["prior_ids"].copy(), "covariances": archive["covariances_m2"].copy()}
         training_prior_observations = len(archive["observation_image_ids"])
     expected = np.diag([prior["sigma_horizontal_m"]**2]*2+[prior["sigma_height_m"]**2])
-    if len(set(anchors["point_ids"])) != len(anchors["point_ids"]) or not np.array_equal(anchors["covariances"], np.broadcast_to(expected, anchors["covariances"].shape)):
+    count = len(anchors["point_ids"])
+    if not count or anchors["point_ids"].shape != (count,) or len(set(anchors["point_ids"])) != count or anchors["means"].shape != (count, 3) or not np.isfinite(anchors["means"]).all() or not np.array_equal(anchors["prior_ids"], np.arange(count)) or anchors["covariances"].shape != (count, 3, 3) or not np.array_equal(anchors["covariances"], np.broadcast_to(expected, (count, 3, 3))):
         raise ValueError("Frozen map IDs or covariances differ from the validated working model")
-    return prior, registration, anchors, {"validation_run_dir": validation["run_dir"], "training_observation_count": validation["training_observation_count"], "training_prior_observations": training_prior_observations}
+    if validation["map_prior_scope"] != "training_frozen" or validation["accepted_track_count"] != count or registration["inlier_point3D_ids"] != anchors["point_ids"].tolist():
+        raise ValueError("Common registration changed the frozen training map collection")
+    return prior, registration, anchors, {"validation_run_dir": validation["run_dir"], "training_observation_count": validation["training_observation_count"], "heldout_observation_count": validation["heldout_observation_count"], "training_prior_observations": training_prior_observations}
+
+def check_formal_observations(model, validation_run_dir):
+    """Verify that formal observations exactly restore frozen training and heldout image evidence."""
+    training = pycolmap.Reconstruction(str(validation_run_dir/"training_visual_model"))
+    with np.load(validation_run_dir/"heldout.npz") as archive:
+        identities, pixels = archive["identities"], archive["pixels"]
+    if identities.ndim != 2 or identities.shape[1] != 3 or pixels.shape != (len(identities), 2) or not len(identities) or not np.isfinite(pixels).all():
+        raise ValueError("Frozen holdout identities or measured pixels are invalid")
+    heldout = {tuple(map(int, identity)): pixel for identity, pixel in zip(identities, pixels)}
+    train_rows, full_rows = get_observations(training), get_observations(model)
+    train_table, full_table = [{row[:3]: row[3] for row in rows} for rows in [train_rows, full_rows]]
+    if len(heldout) != len(identities) or len(train_table) != len(train_rows) or len(full_table) != len(full_rows) or set(train_table) & set(heldout) or set(train_table) | set(heldout) != set(full_table):
+        raise ValueError("Formal observations must uniquely restore the complete training and holdout union")
+    if set(model.points3D) != set(training.points3D) or set(model.images) != set(training.images) or set(model.cameras) != set(training.cameras):
+        raise ValueError("Formal restoration changed shared point, image or camera identities")
+    if get_formal_fingerprint(model)["cameras"] != get_formal_fingerprint(training)["cameras"] or any((image.name, image.camera_id) != (training.images[index].name, training.images[index].camera_id) for index, image in model.images.items()):
+        raise ValueError("Formal restoration changed fixed calibration or image names")
+    points = {image_id: image.points2D for image_id, image in model.images.items()}
+    expected = train_table.copy()
+    expected.update(heldout)
+    for identity, pixel in full_table.items():
+        if not np.isfinite(pixel).all() or not np.array_equal(pixel, expected[identity]) or points[identity[1]][identity[2]].point3D_id != identity[0]:
+            raise ValueError("Formal restoration changed measured pixels or reciprocal image associations")
+    return {"passed": True, "observation_count": len(full_rows), "training_observation_count": len(train_rows), "restored_image_observation_count": len(heldout), "full_observations_sha256": get_observation_digest(sorted(full_rows, key=lambda row: row[:3])), "reciprocal_graph_checked": True}
 
 def prepare_formal_initialization(visual, anchors, registration):
-    """Rebuild the registered map start from visual geometry without reusing an optimized result."""
+    """Restore map XYZ while preserving the already verified serialized visual poses exactly."""
     model = copy.deepcopy(visual)
     lineage = initialize_map_points(model, anchors)
     expected = registration["joint_map_initialization"]["lineage"]["model_fingerprint"]
     actual = get_model_fingerprint(model)
-    if any(actual[field] != expected[field] for field in ["poses", "points", "cameras"]) or get_formal_fingerprint(model)["observations"] != get_formal_fingerprint(visual)["observations"]:
+    visual_state = get_formal_fingerprint(visual)
+    if actual["poses"] != visual_state["poses"] or any(actual[field] != expected[field] for field in ["points", "cameras"]) or get_formal_fingerprint(model)["observations"] != visual_state["observations"]:
         raise ValueError("Formal map initialization differs from the registered handoff")
     return model, lineage
 
@@ -205,12 +240,16 @@ def run_joint_optimization_in_process(config, root, output_dir, run_dir):
         raise RuntimeError("Insufficient resources for full-resolution formal optimization")
     visual = pycolmap.Reconstruction(str(output_dir/"baseline/model"))
     check_registered_visual_model(visual, pycolmap.Reconstruction(str(root/config["native_sfm_dir"])), registration)
+    restoration = check_formal_observations(visual, Path(handoff["validation_run_dir"]))
+    if restoration["training_observation_count"] != handoff["training_observation_count"] or restoration["restored_image_observation_count"] != handoff["heldout_observation_count"]:
+        raise ValueError("Formal restoration counts differ from the frozen validation report")
     model, lineage = prepare_formal_initialization(visual, anchors, registration)
     observations = get_observations(model)
     reached, connected = check_camera_connectivity(model, anchors["point_ids"])
     if not connected or model.num_reg_images() != len(config["image_names"]):
         raise ValueError("Formal camera and point graph is not completely map-connected")
     report.update(registered_images=model.num_reg_images(), sparse_points=model.num_points3D(), accepted_track_count=len(anchors["point_ids"]), observation_count=len(observations), restored_image_observation_count=len(observations)-handoff["training_observation_count"], connected_image_ids=reached, prior_model=prior, map_prior_scope="training_frozen", map_initialization=lineage, visual_reference_model_fingerprint=get_formal_fingerprint(visual), resources={"memory_available_bytes": available, "disk_free_bytes": shutil.disk_usage(joint).free}, solver_policy={"geometry_max_iterations": 300, "feature_max_iterations": 100, "function_tolerance": 1e-6, "gradient_tolerance": 1e-10, "parameter_tolerance": 1e-8, "num_threads": 1, "use_inner_iterations": False}, implementation_sha256=get_sha256(__file__))
+    report["observation_restoration"] = restoration
     (run_dir/"initial_model").mkdir()
     model.write(str(run_dir/"initial_model"))
     dense_path = output_dir/"shared/holdout_dense_features.h5"

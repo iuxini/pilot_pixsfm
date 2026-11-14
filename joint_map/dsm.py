@@ -9,6 +9,7 @@ import rasterio
 from pyproj import Geod
 from joint_map.dense import read_depth_map, read_fused_cloud, read_image_order, read_visibility
 from joint_map.geometry import convert_enu_to_geodetic
+from joint_map.joint import load_confirmed_handoff
 from joint_map.optimization import get_sha256
 
 def get_grid_cells(positions, transform, shape):
@@ -294,10 +295,18 @@ def run_dsm_update(config, root, output_dir, branch, write_json):
     log_path = output_dir/"logs"/f"update_{branch}.log"
     report = {"schema_version": 3, "stage": "update", "branch": branch, "status": "running", "error": None, "gt_inputs_read": False}
     write_json(log_path, report)
+    prior, _, anchors, _ = load_confirmed_handoff(output_dir)
     dense = output_dir/branch/"dense"
     dense_report = json.loads((dense/"summary.json").read_text())
     if dense_report["status"] != "complete":
         raise ValueError("DSM update requires completed branch dense preparation")
+    workspace = Path(dense_report["workspace_path"])
+    frozen = {str(workspace/name): digest for name, digest in dense_report["workspace_sha256"].items()}
+    frozen[str(dense/"summary.json")] = get_sha256(dense/"summary.json")
+    frozen[str(output_dir/"shared/registration.json")] = dense_report["input_identity"]["registration_sha256"]
+    for path, digest in frozen.items():
+        if get_sha256(path) != digest:
+            raise ValueError(f"Frozen MVS workspace or registration changed before DSM update: {path}")
     for name, digest in dense_report["output_sha256"].items():
         if get_sha256(dense/name) != digest:
             raise ValueError("Dense preparation output changed before DSM update")
@@ -308,7 +317,7 @@ def run_dsm_update(config, root, output_dir, branch, write_json):
     if available < 6*1024**3 or shutil.disk_usage(folder).free < 1024**3:
         raise RuntimeError("Insufficient resources for complete point evidence and depth maps")
     policy = {"version": "dsm_reliability_single_cell_layers_v1", "limits": config["update"], "height_gap_m": 1.0, "height_gap_comparison": ">=", "min_points_per_height_layer": 3, "height_reason_priority": ["multiple_height_layers", "ambiguous_height_support"], "mad": "median(abs(height-median(height))); unscaled", "conflict_scope": "optimized shared-point cell only; no dilation", "sampling": "nearest pixel floor(uv+0.5), no clipping", "occlusion": "predicted_z-depth > relative_limit*predicted_z", "reprojection": "maximum bidirectional depth-backprojection error across all depth/normal-consistent support pairs", "depth_uncertainty": "relative_limit*predicted_z is an engineering consistency band, not an estimated covariance", "sparse_dense_link": "same optimized cell and at least two common consistent image IDs"}
-    report.update(policy=policy, resources={"memory_available_bytes": available, "disk_free_bytes": shutil.disk_usage(folder).free}, source_dense_summary_sha256=get_sha256(dense/"summary.json"))
+    report.update(policy=policy, resources={"memory_available_bytes": available, "disk_free_bytes": shutil.disk_usage(folder).free}, source_dense_summary_sha256=get_sha256(dense/"summary.json"), frozen_input_sha256=frozen, map_prior_count=len(anchors["point_ids"]), lambda_map=prior["lambda_map"])
     write_json(log_path, report)
     origin = json.loads((output_dir/"shared/origin.json").read_text())
     dsm_path = root/config["dsm_path"]
@@ -335,6 +344,10 @@ def run_dsm_update(config, root, output_dir, branch, write_json):
         report["source_lineage_sha256"] = get_sha256(source_lineage)
     else:
         base = create_baseline_lineage(output_dir, model)
+    for name, expected in [("shared_point_ids", anchors["point_ids"]), ("prior_ids", anchors["prior_ids"]), ("map_xyz_enu_m", anchors["means"])]:
+        np.testing.assert_array_equal(base[name], expected)
+    if branch == "joint":
+        np.testing.assert_array_equal(base["initial_xyz_enu_m"], anchors["means"])
     lineage, conflicts = check_sparse_dense(model, base, views, origin, profile["transform"], original.shape, config["update"])
     result = build_dsm_update(original, cells, geographic[:, 2], evidence, conflicts, config["update"])
     link_dense_support(lineage, cells, evidence, result["update_mask"])
@@ -345,7 +358,11 @@ def run_dsm_update(config, root, output_dir, branch, write_json):
     with rasterio.open(folder/"updated_dsm.tif") as output:
         written = output.read(1)
     np.testing.assert_array_equal(written[~result["update_mask"]], original[~result["update_mask"]])
-    for path, digest in {**view_hashes, str(dsm_path): dsm_hash}.items():
+    frozen.update(view_hashes)
+    frozen[str(dsm_path)] = dsm_hash
+    frozen.update({str(output_dir/branch/"model"/name): digest for name, digest in dense_report["source_model_sha256"].items()})
+    frozen.update({str(dense/name): digest for name, digest in dense_report["output_sha256"].items()})
+    for path, digest in frozen.items():
         if get_sha256(path) != digest:
             raise ValueError("Input DSM or MVS evidence changed during updating")
     count = int(result["update_mask"].sum())

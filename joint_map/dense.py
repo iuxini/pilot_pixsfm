@@ -6,8 +6,8 @@ import subprocess
 from pathlib import Path
 import numpy as np
 import pycolmap
-from joint_map.joint import check_registered_visual_model
-from joint_map.optimization import get_observations, get_sha256, require_confirmed_prior
+from joint_map.joint import check_registered_visual_model, load_confirmed_handoff
+from joint_map.optimization import get_observations, get_sha256
 
 def read_depth_map(path):
     """Read an unchanged native COLMAP depth array with explicit dimensions."""
@@ -55,6 +55,10 @@ def write_metric_cloud(path, points, scale, rotation, translation):
     normals = np.column_stack([points[key] for key in ["nx", "ny", "nz"]]).astype(np.float64)
     transformed = scale*xyz@rotation.T+translation
     rotated = normals@rotation.T
+    lengths = np.linalg.norm(rotated, axis=1)
+    if not np.isfinite(rotated).all() or np.any(lengths <= 0):
+        raise ValueError("Fused cloud contains invalid or zero normals")
+    rotated /= lengths[:, None]
     dtype = np.dtype([(key, "<f8") for key in ["x", "y", "z", "nx", "ny", "nz"]]+[(key, "u1") for key in ["red", "green", "blue"]])
     result = np.empty(len(points), dtype=dtype)
     for index, key in enumerate(["x", "y", "z"]):
@@ -145,7 +149,7 @@ def check_dense_workspace(path, points, config, depth_scale):
     path = Path(path)
     model = pycolmap.Reconstruction(str(path/"sparse"))
     order = read_image_order(path/"sparse")
-    if sorted(row["name"] for row in order) != config["image_names"]:
+    if sorted(row["name"] for row in order) != sorted(config["image_names"]):
         raise ValueError("MVS workspace does not contain exactly the six requested images")
     point_indices, image_indices = read_visibility(path/"fused.ply.vis", len(points), len(order))
     xyz = np.column_stack([points[key] for key in ["x", "y", "z"]]).astype(np.float64)
@@ -163,6 +167,9 @@ def check_dense_workspace(path, points, config, depth_scale):
         valid_depth = np.isfinite(depth[:, :, 0]) & (depth[:, :, 0] > 0)
         if channels != 1 or normal.shape != (height, width, 3) or max(height, width) != config["dense"]["max_image_size"] or not valid_depth.any():
             raise ValueError("Missing valid full-resolution geometric depths or matching normals")
+        valid_normals = np.isfinite(normal).all(axis=2) & (np.linalg.norm(normal, axis=2) > 0)
+        if not np.all(valid_normals[valid_depth]):
+            raise ValueError("Geometric depths contain missing, nonfinite or zero surface normals")
         selected = point_indices[image_indices == row["image_idx"]]
         local = xyz[selected]@image.rotmat().T+image.tvec
         positive = np.isfinite(local).all(axis=1) & (local[:, 2] > 0)
@@ -180,8 +187,16 @@ def check_dense_workspace(path, points, config, depth_scale):
         agreement = relative <= config["update"]["max_relative_depth_error"]
         if not len(selected) or not agreement.any():
             raise ValueError("Visibility index mapping has no depth-consistent support for an image")
-        checks.append(dict(row, width=width, height=height, valid_depth_pixels=int(valid_depth.sum()), visibility_associations=len(selected), positive_depth_count=int(positive.sum()), inside_image_count=int(inside.sum()), sampled_valid_depth_count=int(usable.sum()), depth_agreement_count=int(agreement.sum()), depth_disagreement_or_missing_count=int(len(selected)-agreement.sum()), depth_scale_to_m=depth_scale, depth_relative_threshold=config["update"]["max_relative_depth_error"]))
+        checks.append(dict(row, width=width, height=height, valid_depth_pixels=int(valid_depth.sum()), valid_normal_pixels=int(np.count_nonzero(valid_depth & valid_normals)), visibility_associations=len(selected), positive_depth_count=int(positive.sum()), inside_image_count=int(inside.sum()), sampled_valid_depth_count=int(usable.sum()), depth_agreement_count=int(agreement.sum()), depth_disagreement_or_missing_count=int(len(selected)-agreement.sum()), depth_scale_to_m=depth_scale, depth_relative_threshold=config["update"]["max_relative_depth_error"]))
     return order, checks
+
+def get_dense_workspace_fingerprints(path, image_names):
+    """Bind reused or published MVS images, geometry, depths, normals and visibility by content."""
+    names = ["fused.ply", "fused.ply.vis", "stereo/patch-match.cfg", "stereo/fusion.cfg"]
+    names.extend("sparse/"+name for name in ["cameras.bin", "images.bin", "points3D.bin"])
+    names.extend("images/"+name for name in image_names)
+    names.extend(f"stereo/{folder}/{name}.geometric.bin" for folder in ["depth_maps", "normal_maps", "consistency_graphs"] for name in image_names)
+    return {name: get_sha256(path/name) for name in names}
 
 def run_dense_preparation(config, root, output_dir, branch, write_json):
     """Prepare one dense branch and publish its summary only after all required artifact checks pass."""
@@ -190,11 +205,7 @@ def run_dense_preparation(config, root, output_dir, branch, write_json):
     report = {"schema_version": 3, "stage": "dense", "branch": branch, "status": "running", "error": None, "gt_inputs_read": False}
     log_path = output_dir/"logs"/f"dense_{branch}.log"
     write_json(log_path, report)
-    registration = json.loads((output_dir/"shared/registration.json").read_text())
-    prior = json.loads((output_dir/"shared/prior_model.json").read_text())
-    require_confirmed_prior(prior)
-    if registration["status"] != "confirmed" or registration["prior_model"] != prior:
-        raise ValueError("Dense preparation requires the same confirmed common registration")
+    registration = load_confirmed_handoff(output_dir)[1]
     native_dir = root/config["native_dense_dir"]
     original = json.loads((native_dir/"summary.json").read_text())
     if original["status"] != "PASS" or original["max_image_size"] != config["dense"]["max_image_size"]:
@@ -203,6 +214,9 @@ def run_dense_preparation(config, root, output_dir, branch, write_json):
     hashes = {name: get_sha256(source_model/name) for name in ["cameras.bin", "images.bin", "points3D.bin"]}
     model = pycolmap.Reconstruction(str(source_model))
     identity = {"source_model_sha256": hashes, "registration_sha256": get_sha256(output_dir/"shared/registration.json"), "colmap_binary_sha256": get_sha256(root/config["colmap_binary"]), "image_sha256": {name: get_sha256(root/config["image_dir"]/name) for name in config["image_names"]}, "original_commands": original["commands"]}
+    identity["native_workspace_sha256"] = get_dense_workspace_fingerprints(native_dir, config["image_names"])
+    if any(identity["native_workspace_sha256"]["images/"+name] != digest for name, digest in identity["image_sha256"].items()):
+        raise ValueError("Original PINHOLE MVS images differ from the configured input images")
     summary_path = destination/"summary.json"
     if summary_path.is_file() and json.loads(summary_path.read_text()).get("input_identity") != identity:
         raise ValueError("Existing dense workspace has different or unverified inputs; refusing stale reuse")
@@ -249,6 +263,9 @@ def run_dense_preparation(config, root, output_dir, branch, write_json):
         transform = (1., np.eye(3), np.zeros(3))
     points = read_fused_cloud(workspace/"fused.ply")
     order, checks = check_dense_workspace(workspace, points, config, transform[0])
+    workspace_hashes = get_dense_workspace_fingerprints(workspace, config["image_names"])
+    if any(workspace_hashes["images/"+name] != digest for name, digest in identity["image_sha256"].items()):
+        raise ValueError("MVS workspace image content differs from its input images")
     write_json(destination/"image_order.json", {"schema_version": 3, "source": "native images.bin record order / Reconstruction::RegImageIds", "sparse_model": str(workspace/"sparse"), "images_bin_sha256": get_sha256(workspace/"sparse/images.bin"), "images": order})
     result = write_metric_cloud(destination/"fused_metric.ply", points, *transform)
     shutil.copy2(workspace/"fused.ply.vis", destination/"fused_metric.ply.vis")
@@ -258,6 +275,9 @@ def run_dense_preparation(config, root, output_dir, branch, write_json):
     for name, digest in hashes.items():
         if get_sha256(source_model/name) != digest:
             raise ValueError("Sparse source model changed during MVS")
+    if get_sha256(output_dir/"shared/registration.json") != identity["registration_sha256"] or get_dense_workspace_fingerprints(native_dir, config["image_names"]) != identity["native_workspace_sha256"]:
+        raise ValueError("Frozen registration or reused native MVS evidence changed during preparation")
+    report["workspace_sha256"] = workspace_hashes
     report.update(status="complete", dense_points=len(points), coordinate_system="local_ENU_m", workspace_path=str(workspace), workspace_sparse_model=str(workspace/"sparse"), depth_scale_to_m=transform[0], depth_maps=checks, image_order_path=str(destination/"image_order.json"), visibility_point_order_preserved=True, dense_filtering="native geometric fusion; additional reliability filtering belongs to module six", output_sha256={name: get_sha256(destination/name) for name in ["fused_metric.ply", "fused_metric.ply.vis", "image_order.json"]}, artifacts={"dense_cloud": str(destination/"fused_metric.ply"), "visibility": str(destination/"fused_metric.ply.vis"), "image_order": str(destination/"image_order.json"), "summary": str(destination/"summary.json")})
     write_json(destination/"summary.json", report)
     write_json(log_path, report)

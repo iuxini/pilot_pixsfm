@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from types import SimpleNamespace
+from PIL import Image
 import numpy as np
 import rasterio
 from rasterio.transform import Affine
@@ -17,15 +18,15 @@ from joint_map.geometry import (
     convert_pose_from_colmap, convert_pose_to_colmap, create_origin,
     get_ecef_to_enu_rotation, sample_dsm, transform_colmap_pose,
 )
-from run_joint_map import PROJECT_ROOT, check_config, get_file_fingerprint
+from run_joint_map import PROJECT_ROOT, check_config, check_inputs, get_file_fingerprint, run_check, write_json
 from joint_map.registration import (
-    apply_sim3, check_camera_connectivity, check_feature_identity,
+    apply_sim3, check_camera_connectivity, check_feature_identity, check_initialized_model, check_track_geometry,
     create_dom_variant, estimate_sim3, fit_sim3, screen_homography,
-    select_map_candidates, transform_pixels, write_initialized_model,
+    select_map_candidates, transform_pixels, write_initialized_model, run_initialization, filter_common_registration,
 )
 from joint_map.optimization import (
-    build_shared_problem, check_gauge_information, compute_huber_cost,
-    compute_robust_scale, create_holdout, create_synthetic_scene,
+    build_shared_problem, check_gauge_information, check_holdout_partition, check_training_priors, compute_huber_cost,
+    compute_robust_scale, create_holdout, create_synthetic_scene, create_training_links, read_module2_map_links,
     get_observations, require_confirmed_prior, run_synthetic_controls,
     audit_training_references, check_dense_cache, compare_dense_and_patch_cache,
     get_observation_digest, sample_dense_holdout,
@@ -194,12 +195,50 @@ class TestMapSampling(unittest.TestCase):
 
 class TestInputProtocol(unittest.TestCase):
     """Check fixed camera requirements, GT exclusion and exact input fingerprints."""
+    def create_fixture(self, root, shape=(4, 5), absolute=False):
+        """Write independent six-view inputs and provenance without historical data or GT."""
+        config = json.loads((PROJECT_ROOT / "configs/joint_map.json").read_text())
+        config.update(image_dir="images", image_names=[f"view_{index}.png" for index in reversed(range(6))], dom_path="dom.tif", dsm_path="dsm.tif", colmap_binary="colmap", native_sfm_dir="native/sfm", native_dense_dir="native/dense", output_dir="run")
+        config["frontend"] = {"features_path": "native/keypoints.h5", "adjusted_features_path": "native/sfm/refined_keypoints.h5", "matches_path": "native/matches.h5"}
+        config["prior_validation"]["selected_model_path"] = "run/shared/prior_model.json"
+        for name in ["images", "native/sfm", "native/dense"]:
+            (root/name).mkdir(parents=True)
+        for index, name in enumerate(config["image_names"]):
+            Image.new("RGB", (3840, 2160), (index, 20, 30)).save(root/"images"/name)
+        transform = Affine(0.00001, 0, 112.99, 0, -0.00001, 28.29)
+        for kind, count, dtype, nodata in [("dom", 3, "int16", 255), ("dsm", 1, "float32", -9999)]:
+            values = np.full((count, *shape), 70, dtype=dtype)
+            values[:, 0, 0] = nodata
+            with rasterio.open(root/(kind+".tif"), "w", driver="GTiff", height=shape[0], width=shape[1], count=count, dtype=dtype, nodata=nodata, crs="EPSG:4326", transform=transform) as dataset:
+                dataset.write(values)
+        model = pycolmap.Reconstruction()
+        model.add_camera(pycolmap.Camera("PINHOLE", 3840, 2160, [2700, 2700, 1920, 1080], id=1))
+        for index, name in enumerate(config["image_names"], 1):
+            model.add_image(pycolmap.Image(name, keypoints=[[1920., 1080.]], camera_id=1, id=index))
+            model.register_image(index)
+        model.add_point3D(np.array([0., 0., 10.]), pycolmap.Track([pycolmap.TrackElement(index, 0) for index in range(1, 7)]))
+        model.write(str(root/"native/sfm"))
+        for name in [*config["frontend"].values(), "native/dense/fused.ply", "native/dense/fused.ply.vis"]:
+            (root/name).write_bytes(b"module one fingerprints this fixture; later modules validate its contents")
+        (root/"colmap").write_text("#!/bin/sh\nexit 0\n")
+        (root/"colmap").chmod(0o755)
+        hashes = {str(root/"images"/name): get_file_fingerprint(root/"images"/name)["sha256"] for name in config["image_names"]}
+        write_json(root/"native/run_config.json", {"image_dir": str(root/"images"), "image_names": config["image_names"], "input_sha256": hashes})
+        if absolute:
+            for key in ["image_dir", "dom_path", "dsm_path", "colmap_binary", "native_sfm_dir", "native_dense_dir", "output_dir"]:
+                config[key] = str(root/config[key])
+            config["frontend"] = {key: str(root/value) for key, value in config["frontend"].items()}
+            config["prior_validation"]["selected_model_path"] = str(root/"run/shared/prior_model.json")
+        return config
+
     def test_fixed_camera_and_nested_gt_rejection(self):
-        """Reject changed intrinsics and evaluation fields at any configuration depth."""
+        """Accept supplied fixed intrinsics and reject invalid calibration or nested GT fields."""
         config = json.loads((PROJECT_ROOT / "configs/joint_map.json").read_text())
         check_config(config)
         altered = copy.deepcopy(config)
         altered["camera"]["params"][0] = 2701
+        check_config(altered)
+        altered["camera"]["params"][0] = 0
         with self.assertRaises(ValueError):
             check_config(altered)
         altered = copy.deepcopy(config)
@@ -216,8 +255,126 @@ class TestInputProtocol(unittest.TestCase):
         self.assertEqual(fingerprint["size_bytes"], 3)
         self.assertEqual(fingerprint["sha256"], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
 
+    def test_configured_names_and_order(self):
+        """Accept arbitrary six-image order and reject duplicates or invalid relative names."""
+        config = json.loads((PROJECT_ROOT/"configs/joint_map.json").read_text())
+        config["image_names"] = [f"view_{index}.png" for index in reversed(range(6))]
+        check_config(config)
+        for names in [["same.png"]*6, ["one.png"], ["/absolute.png"]+config["image_names"][1:], ["../outside.png"]+config["image_names"][1:], [None]+config["image_names"][1:]]:
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                check_config(dict(config, image_names=names))
+
+    def test_input_grids_and_external_absolute_paths(self):
+        """Derive metadata and origin for different grids and inputs outside the checkout."""
+        from unittest.mock import patch
+        for shape, absolute in [((4, 5), False), ((7, 9), True)]:
+            with self.subTest(shape=shape, absolute=absolute), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = self.create_fixture(root, shape, absolute)
+                with patch("run_joint_map.PROJECT_ROOT", root/"separate_checkout" if absolute else root):
+                    check_config(config)
+                    origin, report = check_inputs(config)
+                self.assertEqual(report["maps"]["shape"], list(shape))
+                self.assertEqual(report["maps"]["valid_dsm_pixels"], np.prod(shape)-1)
+                self.assertEqual(report["native_input_identity"]["matched_image_count"], 6)
+                self.assertEqual(report["registered_images"], 6)
+                self.assertEqual(report["sparse_points"], 1)
+                self.assertEqual(report["image_names"], config["image_names"])
+                np.testing.assert_allclose([origin["longitude_deg"], origin["latitude_deg"], origin["ellipsoidal_height_m"]], [112.99+shape[1]*0.000005, 28.29-shape[0]*0.000005, 70], atol=1e-12, rtol=0)
+                self.assertEqual(len(report["input_fingerprints"]), 18)
+                self.assertTrue(all(Path(key).is_absolute() for key in report["input_fingerprints"]))
+
+    def test_same_size_changed_image_rejects_native_reuse(self):
+        """Refuse stale native artifacts even when the image name and dimensions match."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.create_fixture(root)
+            Image.new("RGB", (3840, 2160), (90, 20, 30)).save(root/"images"/config["image_names"][0])
+            with patch("run_joint_map.PROJECT_ROOT", root), self.assertRaisesRegex(ValueError, "Native provenance image hash mismatch"):
+                check_inputs(config)
+
+    def test_invalid_maps_and_incomplete_native_model(self):
+        """Reject incompatible grids, unsupported CRS, empty DSM and missing registrations."""
+        from unittest.mock import patch
+        for mode in ["grid", "crs", "empty_dsm", "unregistered"]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = self.create_fixture(root)
+                if mode == "unregistered":
+                    model = pycolmap.Reconstruction(str(root/"native/sfm"))
+                    model.deregister_image(1)
+                    model.write(str(root/"native/sfm"))
+                else:
+                    with rasterio.open(root/"dsm.tif", "r+") as dataset:
+                        if mode == "grid":
+                            dataset.transform = Affine(0.00002, 0, 112.99, 0, -0.00001, 28.29)
+                        elif mode == "crs":
+                            dataset.crs = "EPSG:3857"
+                        else:
+                            dataset.write(np.full(dataset.shape, -9999, dtype=np.float32), 1)
+                with patch("run_joint_map.PROJECT_ROOT", root), self.assertRaises(ValueError):
+                    check_inputs(config)
+
+    def test_check_handoff_and_changed_inputs_preserve_completed_run(self):
+        """Persist the real check handoff and reject input changes before overwriting evidence."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.create_fixture(root)
+            config_path = root/"config.json"
+            write_json(config_path, config)
+            with patch("run_joint_map.PROJECT_ROOT", root):
+                run_check(config_path)
+            out = root/"run"
+            manifest = json.loads((out/"run_manifest.json").read_text())
+            report = json.loads((out/"logs/check.log").read_text())
+            self.assertEqual(manifest["stages"][-1]["status"], "complete")
+            self.assertEqual(report["origin"], json.loads((out/"shared/origin.json").read_text()))
+            self.assertFalse(report["gt_inputs_read"])
+            saved = {path: path.read_bytes() for path in [out/"run_manifest.json", out/"shared/origin.json", out/"logs/check.log"]}
+            with rasterio.open(root/"dsm.tif", "r+") as dataset:
+                values = dataset.read(1)
+                values[1, 1] += 1
+                dataset.write(values, 1)
+            with patch("run_joint_map.PROJECT_ROOT", root), self.assertRaisesRegex(ValueError, "independent output directory"):
+                run_check(config_path)
+            for path, before in saved.items():
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_prior_selection_path_belongs_to_current_output(self):
+        """Reject a prior record from another run before writing check artifacts."""
+        from unittest.mock import patch
+        config = json.loads((PROJECT_ROOT/"configs/joint_map.json").read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config["output_dir"] = str(root/"run")
+            config_path = root/"config.json"
+            write_json(config_path, config)
+            with patch("run_joint_map.PROJECT_ROOT", root), self.assertRaisesRegex(ValueError, "Selected prior model"):
+                run_check(config_path)
+            self.assertFalse((root/"run").exists())
+
 class TestMapRegistration(unittest.TestCase):
     """Verify DOM coordinate recovery, robust binding and exclusion of candidate evidence."""
+    def create_feature_files(self, model, directory):
+        """Create normalized synthetic descriptors and exact float32 KA row identities."""
+        feature_path, adjusted_path = directory/"keypoints.h5", directory/"refined_keypoints.h5"
+        with h5py.File(feature_path, "w") as features, h5py.File(adjusted_path, "w") as adjusted:
+            for image in model.images.values():
+                keypoints = (np.array([point.xy for point in image.points2D])-0.5).astype(np.float32)
+                for point, pixel in zip(image.points2D, keypoints+np.float32(0.5)):
+                    point.xy = pixel.astype(np.float64)
+                group = features.create_group(image.name)
+                group.create_dataset("keypoints", data=keypoints)
+                descriptors = np.zeros((256, len(keypoints)), dtype=np.float32)
+                descriptors[0] = 1
+                group.create_dataset("descriptors", data=descriptors)
+                group.create_dataset("scores", data=np.ones(len(keypoints), dtype=np.float32))
+                group.create_dataset("image_size", data=[model.cameras[image.camera_id].width, model.cameras[image.camera_id].height])
+                adjusted.create_group(image.name).create_dataset("keypoints", data=keypoints)
+        return feature_path, adjusted_path
+
     def create_candidates(self, count=16):
         """Create independent synthetic image tracks with one DOM candidate per track."""
         source = np.random.default_rng(4).normal(size=(count, 3)) * 10
@@ -341,29 +498,290 @@ class TestMapRegistration(unittest.TestCase):
         self.assertEqual(reached, [1, 2, 3, 4])
         self.assertFalse(check_camera_connectivity(model, [])[1])
 
-    def test_real_identity_and_model_transform(self):
-        """Verify native feature rows and preserve complete real tracks under metric conversion."""
-        directory = PROJECT_ROOT / "outputs/original_pixsfm_20261108"
-        model = pycolmap.Reconstruction(str(directory / "sfm"))
-        identity = check_feature_identity(model, directory / "keypoints.h5", directory / "sfm/refined_keypoints.h5")
-        self.assertEqual(identity["registered_observations"], 18790)
-        point_ids = set(model.points3D)
-        source_point = np.array(model.points3D[next(iter(point_ids))].xyz)
-        point_id = next(iter(point_ids))
-        track = [(entry.image_id, entry.point2D_idx) for entry in model.points3D[point_id].track.elements]
-        image_id = track[0][0]
-        old_image = model.images[image_id]
-        old_camera_point = old_image.rotmat() @ source_point + old_image.tvec
-        transform = (2.5, Rotation.from_euler("xyz", [10, -20, 30], degrees=True).as_matrix(), np.array([10., -20., 30.]))
+    def test_feature_identity_and_model_transform(self):
+        """Verify row identities and complete serialized geometry without historical files or counts."""
+        model, anchors, truth = create_synthetic_scene()
         with tempfile.TemporaryDirectory() as directory:
-            write_initialized_model(model, transform, Path(directory))
-            restored = pycolmap.Reconstruction(directory)
-        self.assertEqual(set(restored.points3D), point_ids)
-        self.assertEqual(restored.num_reg_images(), 6)
-        self.assertEqual([(entry.image_id, entry.point2D_idx) for entry in restored.points3D[point_id].track.elements], track)
-        new_image = restored.images[image_id]
-        new_camera_point = new_image.rotmat() @ restored.points3D[point_id].xyz + new_image.tvec
-        np.testing.assert_allclose(new_camera_point, transform[0] * old_camera_point, atol=1e-10)
+            root = Path(directory)
+            paths = self.create_feature_files(model, root)
+            expected = sum(len(point.track.elements) for point in model.points3D.values())
+            self.assertEqual(check_feature_identity(model, *paths)["registered_observations"], expected)
+            transform = (2.5, Rotation.from_euler("xyz", [10, -20, 30], degrees=True).as_matrix(), np.array([10., -20., 30.]))
+            write_initialized_model(copy.deepcopy(model), transform, root/"model")
+            restored = pycolmap.Reconstruction(str(root/"model"))
+            report = check_initialized_model(model, restored, transform)
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["observations"], expected)
+            self.assertLess(report["max_projection_error_px"], 1e-9)
+
+    def test_invalid_feature_coordinates_and_scores(self):
+        """Reject nonfinite original feature data and mismatched KA rows."""
+        for mode in ["coordinates", "scores", "ka"]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                model, anchors, truth = create_synthetic_scene()
+                features, adjusted = self.create_feature_files(model, Path(directory))
+                with h5py.File(adjusted if mode == "ka" else features, "r+") as archive:
+                    group = archive[model.images[1].name]
+                    if mode == "scores":
+                        group["scores"][0] = np.nan
+                    else:
+                        group["keypoints"][0, 0] = np.nan if mode == "coordinates" else group["keypoints"][0, 0]+1
+                with self.assertRaises(ValueError):
+                    check_feature_identity(model, features, adjusted)
+
+    def test_nonfinite_track_evidence_is_rejected(self):
+        """Reject nonfinite measurements or XYZ before treating a track as reliable."""
+        model, anchors, truth = create_synthetic_scene()
+        point_id = int(anchors["point_ids"][0])
+        model.points3D[point_id].xyz = truth[0]
+        observations = {image_id: image.points2D for image_id, image in model.images.items()}
+        self.assertTrue(check_track_geometry(model, observations, point_id, 2., 1.))
+        observations[1][0].xy[0] = np.nan
+        self.assertFalse(check_track_geometry(model, observations, point_id, 2., 1.))
+        observations[1][0].xy[0] = 320
+        model.points3D[point_id].xyz[2] = np.inf
+        self.assertFalse(check_track_geometry(model, observations, point_id, 2., 1.))
+
+    def test_initialized_handoff_rejects_geometry_and_identity_changes(self):
+        """Detect changed calibration, pixels, shared XYZ and poses in serialized handoffs."""
+        source, anchors, truth = create_synthetic_scene()
+        transform = (1., np.eye(3), np.zeros(3))
+        for mode in ["calibration", "pixels", "xyz", "pose"]:
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                target = copy.deepcopy(source)
+                if mode == "calibration":
+                    target.cameras[1].params[0] += 1
+                elif mode == "pixels":
+                    target.images[1].points2D[0].xy[0] += 1
+                elif mode == "xyz":
+                    target.points3D[int(anchors["point_ids"][0])].xyz[0] += 1
+                else:
+                    target.images[1].tvec[0] += 1
+                check_initialized_model(source, target, transform)
+
+    def test_initialization_common_filter_and_insufficient_anchor_failure(self):
+        """Preserve raw associations and full tracks while freezing only common-consistent priors."""
+        from unittest.mock import patch
+        for mode in ["clean", "outlier", "insufficient"]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                model, anchors, truth = create_synthetic_scene()
+                features, adjusted = self.create_feature_files(model, root)
+                (root/"native").mkdir()
+                model.write(str(root/"native"))
+                output = root/"run"
+                write_json(output/"shared/origin.json", create_origin(112.99, 28.29, 70))
+                transform = (2.5, Rotation.from_euler("xyz", [10, -20, 30], degrees=True).as_matrix(), np.array([10., -20., 30.]))
+                source = np.array([model.points3D[int(point_id)].xyz for point_id in anchors["point_ids"]])
+                means = apply_sim3(source, transform)
+                outlier = mode != "clean"
+                if outlier:
+                    means[0] += [10, 0, 0]
+                count = len(source)
+                links = {"track_ids": anchors["point_ids"].copy(), "means_enu_m": means, "image_ids": np.ones(count, dtype=np.int64), "scores": np.ones(count), "homography_pass": np.ones(count, dtype=bool), "rejection_codes": np.full(count, "pending_3d", dtype="U64")}
+                config = {"native_sfm_dir": "native", "frontend": {"features_path": str(features), "adjusted_features_path": str(adjusted)}, "map_association": {"sim3_inlier_threshold_m": 2., "homography_forward_threshold_dom_px": 3., "min_tracks": count if mode == "insufficient" else 12}}
+                accepted = np.ones(count, dtype=bool)
+                selection = (accepted, np.full(count, "accepted_independent_3d"), np.zeros(count), np.full(count, count-1), np.arange(count), [])
+                with patch("joint_map.registration.extract_dom_features", return_value={"variants": []}), patch("joint_map.registration.match_dom_features"), patch("joint_map.registration.collect_map_candidates", return_value=(links, source, [])), patch("joint_map.registration.select_map_candidates", return_value=selection):
+                    report = run_initialization(config, root, output, write_json)
+                with np.load(output/"shared/track_map_links.npz") as archive:
+                    self.assertEqual(int(archive["selected_for_prior"].sum()), 0 if mode == "insufficient" else count-int(outlier))
+                    self.assertEqual(int(archive["independent_selected_for_prior"].sum()), count)
+                    self.assertTrue(archive["independent_accepted"].all())
+                    np.testing.assert_array_equal(archive["means_enu_m"], means)
+                    np.testing.assert_array_equal(archive["track_ids"], anchors["point_ids"])
+                    if outlier:
+                        self.assertEqual(archive["rejection_codes"][0], "common_track_outlier")
+                        self.assertTrue(archive["common_rejected"][0])
+                        self.assertEqual(archive["prior_ids"][0], -1)
+                self.assertEqual(report["status"], "failed" if mode == "insufficient" else "complete")
+                self.assertFalse(report["gt_inputs_read"])
+                if outlier:
+                    self.assertEqual(report["common_registration"]["outlier_point_ids"], [int(anchors["point_ids"][0])])
+                    self.assertGreater(report["common_registration"]["steps"][0]["errors_m"][0], 9.9)
+                if mode == "insufficient":
+                    self.assertFalse((output/"joint/model").exists())
+                    self.assertFalse((output/"shared/registration.json").exists())
+                else:
+                    self.assertTrue(all(row["passed"] for row in report["branch_geometry"].values()))
+                    self.assertLessEqual(max(report["common_registration"]["errors_m"]), 2.)
+                    registration = json.loads((output/"shared/registration.json").read_text())
+                    self.assertEqual(registration["track_map_links_sha256"], hashlib.sha256((output/"shared/track_map_links.npz").read_bytes()).hexdigest())
+                    self.assertEqual(len(registration["inlier_point3D_ids"]), count-int(outlier))
+                    for branch in ["baseline", "joint"]:
+                        restored = pycolmap.Reconstruction(str(output/branch/"model"))
+                        self.assertEqual(set(restored.points3D), set(model.points3D))
+                        self.assertEqual(sum(len(point.track.elements) for point in restored.points3D.values()), sum(len(point.track.elements) for point in model.points3D.values()))
+                    prior = json.loads((output/"shared/prior_model.json").read_text())
+                    self.assertEqual(prior["status"], "unvalidated")
+
+    def test_common_filter_refits_until_stable_without_reinstating_tracks(self):
+        """Recheck after each refit and never reinstate a track rejected by an earlier transform."""
+        from unittest.mock import patch
+        source, links, transform = self.create_candidates()
+        links["means_enu_m"] = source.copy()
+        links["means_enu_m"][0] += [3, 0, 0]
+        links["means_enu_m"][1] -= [1, 0, 0]
+        selected = np.arange(len(source))
+        initial = (1., np.eye(3), np.zeros(3))
+        shifted = (1., np.eye(3), np.array([1.5, 0, 0]))
+        with patch("joint_map.registration.estimate_sim3", return_value=(initial, np.ones(len(source), dtype=bool))), patch("joint_map.registration.fit_sim3", side_effect=[shifted, initial]):
+            fitted, retained, report = filter_common_registration(links, source, selected, 2., 12)
+        np.testing.assert_array_equal(selected, np.arange(len(source)))
+        np.testing.assert_array_equal(retained, np.arange(2, len(source)))
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["outlier_point_ids"], [0, 1])
+        self.assertEqual(len(report["steps"]), 3)
+        self.assertEqual(report["steps"][0]["rejected_point_ids"], [0])
+        self.assertEqual(report["steps"][1]["rejected_point_ids"], [1])
+        self.assertEqual(report["steps"][2]["rejected_point_ids"], [])
+
+    def test_common_filter_includes_exact_threshold_and_rejects_degeneracy(self):
+        """Keep the existing inclusive two-meter boundary and reject a degenerate common fit."""
+        from unittest.mock import patch
+        source, links, transform = self.create_candidates()
+        links["means_enu_m"] = source.copy()
+        links["means_enu_m"][0, 0] += 2
+        selected = np.arange(len(source))
+        identity = (1., np.eye(3), np.zeros(3))
+        with patch("joint_map.registration.estimate_sim3", return_value=(identity, np.zeros(len(source), dtype=bool))):
+            fitted, retained, report = filter_common_registration(links, source, selected, 2., 12)
+        np.testing.assert_array_equal(retained, selected)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["errors_m"][0], 2.)
+        line = np.column_stack([np.arange(4), np.zeros((4, 2))])
+        degenerate = {"track_ids": np.arange(4), "means_enu_m": line.copy()}
+        fitted, retained, report = filter_common_registration(degenerate, line, np.arange(4), 2., 3)
+        self.assertIsNone(fitted)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("degenerate", report["error"])
+
+class TestModule3Inputs(unittest.TestCase):
+    """Check dynamic partitions, frozen module-two exclusions and finite training-only priors."""
+    def test_distinct_feature_rows_in_one_image_are_preserved(self):
+        """Keep native same-image track entries when their full observation identities differ."""
+        model, anchors, truth = create_synthetic_scene()
+        removed_id = int(anchors["point_ids"][-1])
+        feature_id = model.points3D[removed_id].track.elements[0].point2D_idx
+        model.delete_point3D(removed_id)
+        model.add_observation(int(anchors["point_ids"][0]), pycolmap.TrackElement(1, feature_id))
+        original = get_observations(model)
+        training, heldout = create_holdout(model, 0.2, 0)
+        report = check_holdout_partition(model, training, heldout, 0.2)
+        self.assertTrue(report["passed"])
+        self.assertEqual(len(original), len(get_observations(training))+len(heldout))
+        self.assertEqual(set(model.points3D), set(training.points3D))
+
+    def test_dynamic_partition_sizes_and_reproducibility(self):
+        """Derive different split sizes from two synthetic scenes while preserving geometry."""
+        for count in [12, 24]:
+            with self.subTest(count=count):
+                model, anchors, truth = create_synthetic_scene()
+                for point_id in anchors["point_ids"][count:]:
+                    model.delete_point3D(int(point_id))
+                training, heldout = create_holdout(model, 0.2, 0)
+                repeated, same_heldout = create_holdout(model, 0.2, 0)
+                report = check_holdout_partition(model, training, heldout, 0.2)
+                self.assertEqual(report["original_observation_count"], 6*count)
+                self.assertEqual(report["heldout_observation_count"], int(count*0.2))
+                self.assertEqual(report["training_observation_count"], 6*count-int(count*0.2))
+                self.assertEqual([row[:3] for row in heldout], [row[:3] for row in same_heldout])
+                self.assertEqual(get_observation_digest(get_observations(training)), get_observation_digest(get_observations(repeated)))
+
+    def test_partition_rejects_overlap_missing_rows_pixels_and_geometry(self):
+        """Reject malformed splits and reciprocal leaks instead of trusting their counts."""
+        for mode in ["duplicate", "overlap", "missing", "pixels", "geometry", "reciprocal"]:
+            with self.subTest(mode=mode):
+                model, anchors, truth = create_synthetic_scene()
+                training, heldout = create_holdout(model, 0.2, 0)
+                if mode == "duplicate":
+                    heldout.append(heldout[0])
+                elif mode == "overlap":
+                    heldout[0] = next(row for row in get_observations(training) if row[0] == heldout[0][0])
+                elif mode == "missing":
+                    row = get_observations(training)[0]
+                    training.delete_observation(row[1], row[2])
+                elif mode == "pixels":
+                    row = get_observations(training)[0]
+                    training.images[row[1]].points2D[row[2]].xy[0] += 0.125
+                elif mode == "geometry":
+                    training.images[1].tvec[0] += 0.01
+                else:
+                    row = heldout[0]
+                    training.images[row[1]].points2D[row[2]].point3D_id = row[0]
+                with self.assertRaises(ValueError):
+                    check_holdout_partition(model, training, heldout, 0.2)
+
+    def test_training_prior_identity_finiteness_and_covariance(self):
+        """Reject invalid shared IDs, means and covariance scales before freezing priors."""
+        from joint_map.optimization import write_map_priors
+        model, anchors, truth = create_synthetic_scene()
+        valid = check_training_priors(model, anchors, 12)
+        self.assertEqual(valid["map_prior_count"], len(anchors["point_ids"]))
+        for mode in ["duplicate", "missing", "nonfinite", "insufficient"]:
+            with self.subTest(mode=mode):
+                altered = copy.deepcopy(anchors)
+                if mode == "duplicate":
+                    altered["point_ids"][0] = altered["point_ids"][1]
+                elif mode == "missing":
+                    altered["point_ids"][0] = 999999
+                elif mode == "nonfinite":
+                    altered["means"][0, 0] = np.nan
+                with self.assertRaises(ValueError):
+                    check_training_priors(model, altered, len(anchors["point_ids"])+1 if mode == "insufficient" else 12)
+        count = len(anchors["point_ids"])
+        complete = dict(anchors, selected_link_indices=np.arange(count), source_prior_ids=np.arange(count), map_feature_ids=np.arange(count), dom_pixels=np.zeros((count, 2)))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"priors.npz"
+            for value in [0., -1., np.nan, np.inf]:
+                with self.subTest(scale=value), self.assertRaises(ValueError):
+                    write_map_priors(model, complete, {"sigma_horizontal_m": 0.3, "sigma_height_m": value}, path)
+            self.assertFalse(path.exists())
+            write_map_priors(model, complete, {"sigma_horizontal_m": 0.3, "sigma_height_m": 0.2}, path)
+            with np.load(path) as archive:
+                self.assertTrue((np.linalg.eigvalsh(archive["covariances_m2"]) > 0).all())
+
+    def test_training_links_preserve_frozen_exclusions_and_original_rows(self):
+        """Exclude heldout votes and common-rejected tracks without renumbering source rows."""
+        from unittest.mock import patch
+        from joint_map.optimization import get_sha256
+        model, anchors, truth = create_synthetic_scene()
+        for point_id, position in zip(anchors["point_ids"], truth):
+            model.points3D[int(point_id)].xyz = position
+        count = len(anchors["point_ids"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            features, adjusted = TestMapRegistration().create_feature_files(model, root)
+            training, heldout = create_holdout(model, 0.2, 0)
+            image_ids = np.ones(count, dtype=np.int64)
+            for point_id, image_id, feature_id, pixel in heldout:
+                image_ids[np.flatnonzero(anchors["point_ids"] == point_id)[0]] = image_id
+            pool = np.arange(count) != 0
+            links = {"track_ids": anchors["point_ids"], "image_ids": image_ids, "feature_ids": np.arange(count), "means_enu_m": truth, "dom_pixels": np.zeros((count, 2)), "dom_feature_ids": np.arange(count), "dom_variant_ids": np.zeros(count, dtype=np.int64), "scores": np.ones(count), "rejection_codes": np.full(count, "pending_3d", dtype="U64"), "homography_pass": np.ones(count, dtype=bool), "selected_for_prior": pool, "accepted": pool, "common_rejected": ~pool, "prior_ids": np.r_[-1, np.arange(count-1)]}
+            out = root/"run"
+            (out/"shared").mkdir(parents=True)
+            path = out/"shared/track_map_links.npz"
+            np.savez_compressed(path, **links)
+            write_json(out/"shared/registration.json", {"status": "provisional", "map_collection_scope": "module2_common_frozen", "track_map_links_sha256": get_sha256(path), "selected_link_indices": np.flatnonzero(pool).tolist(), "inlier_point3D_ids": anchors["point_ids"][pool].tolist()})
+            config = {"frontend": {"features_path": str(features)}, "update": {"max_reprojection_error_px": 2., "min_triangulation_angle_deg": 1.}, "map_association": {"homography_forward_threshold_dom_px": 3., "sim3_inlier_threshold_m": 2., "min_tracks": 12}}
+            def screen_training_rows(pixels, dom_pixels, threshold):
+                """Isolate partition and pool logic from the separately tested homography estimator."""
+                return np.zeros(len(pixels)), np.eye(3)
+            with patch("joint_map.optimization.screen_homography", side_effect=screen_training_rows):
+                selected = create_training_links(config, root, out, training, heldout)
+            self.assertNotIn(int(anchors["point_ids"][0]), selected["point_ids"])
+            self.assertTrue(set(selected["point_ids"]) <= set(anchors["point_ids"][pool]))
+            np.testing.assert_array_equal(selected["map_feature_ids"], selected["selected_link_indices"])
+            np.testing.assert_array_equal(selected["source_prior_ids"], links["prior_ids"][selected["selected_link_indices"]])
+            self.assertEqual(selected["excluded_map_votes"], len(heldout))
+            self.assertEqual(selected["excluded_module2_pool_votes"], 1)
+            self.assertEqual(get_sha256(path), selected["module2_links_sha256"])
+            pairs = {(row[1], row[2]) for row in heldout}
+            self.assertFalse({(int(links["image_ids"][index]), int(links["feature_ids"][index])) for index in selected["selected_link_indices"]} & pairs)
+            links["scores"][0] = 0.5
+            np.savez_compressed(path, **links)
+            with self.assertRaises(ValueError):
+                read_module2_map_links(out)
 
 class TestSharedMapPriors(unittest.TestCase):
     """Verify actual native parameter sharing, prior whitening and synthetic behavior."""
@@ -482,6 +900,41 @@ class TestSharedMapPriors(unittest.TestCase):
 
 class TestDenseHoldoutFeatures(unittest.TestCase):
     """Check full-map identity, numerical equivalence and strict predicted-position coverage."""
+    def test_configured_cache_creation_reuse_and_mismatch_refusal(self):
+        """Create missing caches under either output path style and reuse only matching immutable data."""
+        from unittest.mock import patch, Mock
+        from joint_map.optimization import prepare_dense_holdout_cache
+        data = np.ones((32, 128, 128), dtype=np.float16)
+        names = ["first.png", "second.png"]
+        provenance = {"images": {name: {"original_size": [256, 64], "feature_shape": list(data.shape), "sha256": name} for name in names}, "extraction": {"sparse": True, "use_cache": True}}
+        for absolute in [False, True]:
+            with self.subTest(absolute=absolute), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                destination = root/"chosen_output"
+                config = {"image_dir": "input", "image_names": names, "output_dir": str(destination) if absolute else "chosen_output"}
+                extraction = Mock(return_value=[{"patches": data[None], "metadata": {"scale": [0.5, 0.5]}}])
+                with patch("joint_map.optimization.get_dense_provenance", return_value=provenance), patch("joint_map.optimization.FeatureExtractor", return_value=extraction) as factory, patch("joint_map.optimization.torch.cuda.is_available", return_value=True), patch("joint_map.optimization.torch.cuda.mem_get_info", return_value=(8*1024**3, 16*1024**3)), patch("joint_map.optimization.torch.cuda.get_device_name", return_value="synthetic GPU"), patch("joint_map.optimization.shutil.disk_usage", return_value=SimpleNamespace(free=10*1024**3)):
+                    result = prepare_dense_holdout_cache(config, root)
+                    path = destination/"shared/holdout_dense_features.h5"
+                    self.assertEqual(Path(result["path"]), path)
+                    self.assertTrue(path.is_file())
+                    self.assertFalse(result["reused"])
+                    self.assertEqual(extraction.call_count, len(names))
+                    self.assertFalse(factory.call_args.args[0]["sparse"])
+                    self.assertFalse(factory.call_args.args[0]["use_cache"])
+                    before = path.read_bytes()
+                    repeated = prepare_dense_holdout_cache(config, root)
+                    self.assertTrue(repeated["reused"])
+                    self.assertEqual(extraction.call_count, len(names))
+                    self.assertEqual(path.read_bytes(), before)
+                    with h5py.File(path, "r+") as archive:
+                        archive.attrs["provenance"] = "{}"
+                    mismatched = path.read_bytes()
+                    with self.assertRaises(ValueError):
+                        prepare_dense_holdout_cache(config, root)
+                    self.assertEqual(path.read_bytes(), mismatched)
+                    self.assertEqual(extraction.call_count, len(names))
+
     def test_complete_matching_cache_and_content_hash(self):
         """Refuse incomplete, mismatched or corrupted caches without overwriting them."""
         data = np.ones((12, 16, 128), dtype=np.float16)
@@ -1046,12 +1499,12 @@ class TestMultiscaleDerivative(unittest.TestCase):
         self.assertTrue(all(row["D"] is None for row in numerical["levels"]))
 
     def test_native_quaternion_chord_representation_at_every_scale(self):
-        """Validate the native quaternion convention for identity and general unit inputs at all seven steps."""
+        """Validate the native quaternion convention at every permitted initial and extension step."""
         from joint_map.optimization import check_actual_perturbation
         manifold = pyceres.QuaternionManifold()
         for q in [np.array([1., 0, 0, 0]), np.array([0.7, -0.2, 0.3, 0.6])/np.sqrt(0.98)]:
             for axis in np.eye(3):
-                for k in range(7):
+                for k in range(11):
                     step = 1e-6/(2**k)
                     result = check_actual_perturbation(q, manifold.plus(q, -axis*step), manifold.plus(q, axis*step), 0, axis, step)
                     self.assertTrue(result["valid"])
@@ -1065,7 +1518,76 @@ class TestMultiscaleDerivative(unittest.TestCase):
         self.assertEqual(result["center_cells"], [[5, 6]])
         self.assertFalse(result["numerical"]["levels"][0]["same_segment"])
         self.assertEqual(result["numerical"]["selected_window"], 3)
+        self.assertEqual(result["numerical"]["level_count"], 7)
+        self.assertFalse(result["numerical"]["extended"])
         json.dumps(result, allow_nan=False)
+
+    def test_cross_segment_extension_stops_at_first_window_or_eleven_levels(self):
+        """Append only the needed finer levels without changing the sample or shared 128-channel window."""
+        from joint_map.optimization import verify_multiscale_direction
+        for distance, expected_levels, expected_window in [(1e-5, 8, 6), (5e-6, 9, 7), (1e-6, 11, 9), (1e-7, 11, None)]:
+            with self.subTest(distance=distance):
+                feature, blocks, manifold, interpolation = self.create_native_feature(3.5+distance)
+                result = verify_multiscale_direction(feature, blocks, 1, np.array([1., 0., 0.]), manifold, interpolation)
+                numerical = result["numerical"]
+                self.assertEqual(numerical["level_count"], expected_levels)
+                self.assertEqual(numerical["selected_window"], expected_window)
+                self.assertTrue(numerical["extended"])
+                self.assertEqual(numerical["extension_trigger"]["initial_reason"], ["cross_segment"])
+                self.assertEqual(result["identity"], list(feature.identity))
+                if expected_window is None:
+                    self.assertEqual(result["status"], "inconclusive")
+                    self.assertIsNone(result["comparison"])
+                else:
+                    self.assertEqual(result["status"], "passed")
+                    self.assertEqual(result["comparison"]["channels"], ["passed"]*128)
+
+    def test_extension_is_independent_of_wrong_analytic_derivatives(self):
+        """Freeze identical levels and windows before comparing correct or deliberately wrong derivatives."""
+        from joint_map.optimization import verify_multiscale_direction
+        feature, blocks, manifold, interpolation = self.create_native_feature(3.50001)
+        axis = np.array([1., 0., 0.])
+        correct = verify_multiscale_direction(feature, blocks, 1, axis, manifold, interpolation)
+        def evaluate_wrong_derivatives(*parameters):
+            """Keep native descriptor samples identical while corrupting only the translation Jacobian."""
+            values, derivatives = feature.native.evaluate(*parameters)
+            return values, [derivative*2 if index == 1 else derivative for index, derivative in enumerate(derivatives)]
+        changed = SimpleNamespace(native=SimpleNamespace(evaluate=evaluate_wrong_derivatives), patch=feature.patch, identity=feature.identity)
+        wrong = verify_multiscale_direction(changed, blocks, 1, axis, manifold, interpolation)
+        self.assertEqual(correct["status"], "passed")
+        self.assertEqual(wrong["status"], "mismatch")
+        self.assertEqual(json.dumps(correct["numerical"], sort_keys=True), json.dumps(wrong["numerical"], sort_keys=True))
+
+    def test_non_cross_segment_failures_do_not_trigger_more_samples(self):
+        """Stop for rounding or unstable estimates and stop extending once another reason appears."""
+        from joint_map.optimization import verify_multiscale_direction
+        for principal, mode, expected_levels in [(3.25, "rounding_limited", 7), (3.25, "unstable_estimate", 7), (3.50001, "rounding_limited", 8)]:
+            with self.subTest(principal=principal, mode=mode):
+                feature, blocks, manifold, interpolation = self.create_native_feature(principal)
+                calls = []
+                def evaluate_unresolved(*parameters):
+                    """Provide function values with known uncertainty without exposing any analytic derivative."""
+                    calls.append(float(parameters[1][0]))
+                    value = 1e12 if mode == "rounding_limited" else np.sin(parameters[1][0]*1e8)
+                    return np.full((128, 1), value), None
+                unresolved = SimpleNamespace(native=SimpleNamespace(evaluate=evaluate_unresolved), patch=feature.patch, identity=feature.identity)
+                result = verify_multiscale_direction(unresolved, blocks, 1, np.array([1., 0., 0.]), manifold, interpolation)
+                self.assertEqual(result["status"], "inconclusive")
+                self.assertIn(mode, result["reason"])
+                self.assertEqual(result["numerical"]["level_count"], expected_levels)
+                self.assertEqual(len(calls), 1+2*expected_levels)
+                self.assertIsNone(result["comparison"])
+
+    def test_extended_policy_preserves_thresholds_and_rejects_excess_layers(self):
+        """Keep all numerical constants and reject input exceeding the approved eleven-layer ceiling."""
+        from joint_map.optimization import get_derivative_policy, select_multiscale_reference
+        policy = get_derivative_policy()
+        self.assertEqual(policy["version"], "multiscale_richardson_roundguard_v2")
+        self.assertEqual((policy["initial_level_count"], policy["max_level_count"], policy["channels"]), (7, 11, 128))
+        self.assertEqual((policy["comparison_atol"], policy["comparison_rtol"], policy["stability_fraction"], policy["rounding_coefficient"]), (1e-5, 1e-4, 0.1, 8.))
+        center, levels = self.create_sample_levels(lambda value: value)
+        with self.assertRaises(ValueError):
+            select_multiscale_reference(center, levels+[levels[-1]]*5)
 
     def test_all_windows_crossing_a_knot_remain_inconclusive(self):
         """Stop at unresolved interpolation segments without switching to one-sided differences."""
@@ -1075,6 +1597,7 @@ class TestMultiscaleDerivative(unittest.TestCase):
         self.assertEqual(result["status"], "inconclusive")
         self.assertIn("cross_segment", result["reason"])
         self.assertIsNone(result["comparison"])
+        self.assertEqual(result["numerical"]["level_count"], 11)
         blocks[2][2] = -1
         invalid = verify_multiscale_direction(feature, blocks, 1, np.array([1., 0., 0.]), manifold, interpolation)
         self.assertEqual(invalid["reason"], "invalid_center_projection")
@@ -1093,31 +1616,19 @@ class TestMultiscaleDerivative(unittest.TestCase):
         self.assertEqual(classify_multiscale_derivative(numerical, analytic)["status"], "mismatch")
         self.assertEqual(classify_multiscale_derivative(numerical, np.zeros(128))["status"], "passed")
 
-    def test_original_failed_native_direction_under_the_new_fixed_policy(self):
-        """Reproduce the saved old failure and verify all 128 channels with retained native owners."""
-        from pixsfm import residuals as native_residuals
+    def test_native_directions_without_historical_inputs(self):
+        """Verify every tangent block direction on synthetic full maps with retained native owners."""
         from joint_map.optimization import verify_multiscale_direction
-        case_path = PROJECT_ROOT/"outputs/joint_map/shared/candidates/20261109_155215_383991/derivative_case.npz"
-        with np.load(case_path) as case:
-            blocks = [case[name].copy() for name in ["q", "translation", "point", "intrinsics"]]
-            identity = case["identity"].copy()
-            axis = case["axis"].copy()
-            saved = case["analytic"].copy()
-        model = pycolmap.Reconstruction(str(PROJECT_ROOT/"outputs/joint_map/joint/model"))
-        name = model.images[int(identity[1])].name
-        with h5py.File(PROJECT_ROOT/"outputs/joint_map/shared/holdout_dense_features.h5", "r") as cache:
-            data = cache[name]["features"][:]
-            scale = np.asarray(cache[name].attrs["scale"], dtype=np.float64)
-        patch = features.FeaturePatch(data, np.zeros(2, dtype=np.int32), scale, False)
-        interpolation = InterpolationConfig(interpolation_default_conf)
-        reference = np.zeros((1, 128))
-        native = native_residuals.FeatureReferenceCostFunctor(1, patch, reference, interpolation)
-        feature = SimpleNamespace(native=native, patch=patch, identity=identity.tolist())
-        result = verify_multiscale_direction(feature, blocks, 0, axis, pyceres.QuaternionManifold(), interpolation)
-        self.assertEqual(result["status"], "passed")
-        self.assertEqual(result["numerical"]["selected_window"], 2)
-        np.testing.assert_array_equal(result["comparison"]["analytic"], saved)
-        self.assertEqual(result["comparison"]["channels"], ["passed"]*128)
+        feature, blocks, manifold, interpolation = self.create_native_feature(3.25)
+        blocks[0] = np.array([0.98, 0.02, -0.04, 0.05])/np.linalg.norm([0.98, 0.02, -0.04, 0.05])
+        blocks[2] = np.array([0.1, -0.1, 1.])
+        for block_index in [0, 1, 2]:
+            for axis in np.eye(3):
+                with self.subTest(block=block_index, axis=axis.tolist()):
+                    result = verify_multiscale_direction(feature, blocks, block_index, axis, manifold, interpolation)
+                    self.assertEqual(result["status"], "passed")
+                    self.assertIsNotNone(result["numerical"]["selected_window"])
+                    self.assertEqual(result["comparison"]["channels"], ["passed"]*128)
 
 class TestFormalJointOptimization(unittest.TestCase):
     """Check confirmed full-observation solving, serialization and the sparse-only handoff."""
@@ -1128,6 +1639,99 @@ class TestFormalJointOptimization(unittest.TestCase):
     def create_report(self):
         """Create explicit not_run states for the two required solver stages."""
         return {"status": "running", "error": None, "geometry": {"executed": False, "status": "not_run"}, "feature": {"executed": False, "status": "not_run"}}
+
+    def test_formal_observations_restore_dynamic_frozen_union(self):
+        """Restore the exact split at different sizes despite a changed common world transform."""
+        from joint_map.joint import check_formal_observations
+        for count in [12, 24]:
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                model, anchors, truth = create_synthetic_scene()
+                for point_id in anchors["point_ids"][count:]:
+                    model.delete_point3D(int(point_id))
+                training, heldout = create_holdout(model, 0.2, 0)
+                (directory/"training_visual_model").mkdir()
+                training.write(str(directory/"training_visual_model"))
+                np.savez(directory/"heldout.npz", identities=np.array([row[:3] for row in heldout]), pixels=np.array([row[3] for row in heldout]))
+                transform = (1.2, Rotation.from_euler("xyz", [8., -4., 17.], degrees=True).as_matrix(), np.array([4., -2., 1.]))
+                (directory/"registered").mkdir()
+                write_initialized_model(model, transform, directory/"registered")
+                restored = pycolmap.Reconstruction(str(directory/"registered"))
+                report = check_formal_observations(restored, directory)
+                self.assertTrue(report["passed"])
+                self.assertEqual(report["observation_count"], count*6)
+                self.assertEqual(report["training_observation_count"], count*6-len(heldout))
+                self.assertEqual(report["restored_image_observation_count"], len(heldout))
+
+    def test_formal_restoration_rejects_changed_or_incomplete_evidence(self):
+        """Reject duplicate, overlapping, missing, altered or nonreciprocal image evidence."""
+        from joint_map.joint import check_formal_observations
+        for mode in ["duplicate", "overlap", "missing", "pixels", "reciprocal", "intrinsics"]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                model, anchors, truth = create_synthetic_scene()
+                training, heldout = create_holdout(model, 0.2, 0)
+                (directory/"training_visual_model").mkdir()
+                training.write(str(directory/"training_visual_model"))
+                row = get_observations(model)[0]
+                if mode == "duplicate":
+                    heldout.append(heldout[0])
+                elif mode == "overlap":
+                    heldout[0] = get_observations(training)[0]
+                elif mode == "missing":
+                    model.delete_observation(row[1], row[2])
+                elif mode == "pixels":
+                    model.images[row[1]].points2D[row[2]].xy[0] += 0.1
+                elif mode == "reciprocal":
+                    model.images[row[1]].points2D[row[2]].point3D_id = 9999
+                else:
+                    next(iter(model.cameras.values())).params[0] += 0.1
+                np.savez(directory/"heldout.npz", identities=np.array([item[:3] for item in heldout]), pixels=np.array([item[3] for item in heldout]))
+                with self.assertRaises(ValueError):
+                    check_formal_observations(model, directory)
+
+    def test_confirmed_handoff_checks_frozen_scales_and_map_identities(self):
+        """Reject self-consistent metadata that changes validated scales or frozen map semantics."""
+        from joint_map.joint import load_confirmed_handoff
+        from joint_map.optimization import get_sha256, write_validation_json
+        for mode in ["valid", "sigma_pixel_px", "lambda_feature", "robust_loss", "prior_ids", "means", "registration_ids"]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                shared = output/"shared"
+                shared.mkdir()
+                (output/"logs").mkdir()
+                model, anchors, truth = create_synthetic_scene()
+                count = len(anchors["point_ids"])
+                scales = dict(self.get_scales(), robust_loss={"name": "huber", "normalized_threshold": 3.})
+                covariance = np.diag([scales["sigma_horizontal_m"]**2]*2+[scales["sigma_height_m"]**2])
+                prior_ids = np.arange(count)
+                if mode == "prior_ids":
+                    prior_ids[0] = prior_ids[1]
+                if mode == "means":
+                    anchors["means"][0, 0] = np.nan
+                np.savez(shared/"map_priors.npz", shared_point_ids=anchors["point_ids"], means_enu_m=anchors["means"], prior_ids=prior_ids, covariances_m2=np.broadcast_to(covariance, (count, 3, 3)), observation_image_ids=np.array([row[1] for row in get_observations(model)]))
+                np.savez(shared/"training_references.npz", descriptors=np.zeros((count, 128)))
+                write_validation_json(shared/"run.json", {"frozen_files": {str(shared/name): get_sha256(shared/name) for name in ["map_priors.npz", "training_references.npz"]}})
+                validation = {"status": "complete", "candidates": [{"candidate_id": "weight_1p0", "status": "passed", "information_scale": 1.}], "policy_sha256": "frozen_policy", "run_dir": str(shared), "scales": scales, "map_prior_scope": "training_frozen", "accepted_track_count": count, "training_observation_count": 140, "heldout_observation_count": 4}
+                write_validation_json(shared/"prior_validation.json", validation)
+                prior = dict(scales, status="confirmed", candidate_id="weight_1p0", user_confirmation="selected 1.0", map_prior_scope="training_frozen", policy_sha256="frozen_policy")
+                if mode in ["sigma_pixel_px", "lambda_feature"]:
+                    prior[mode] *= 2
+                if mode == "robust_loss":
+                    prior[mode] = {"name": "huber", "normalized_threshold": 4.}
+                for field, name in [("validation_sha256", "prior_validation.json"), ("map_priors_sha256", "map_priors.npz"), ("reference_sha256", "training_references.npz")]:
+                    prior[field] = get_sha256(shared/name)
+                write_validation_json(shared/"prior_model.json", prior)
+                ids = anchors["point_ids"].tolist()
+                write_validation_json(shared/"registration.json", {"status": "confirmed", "priors_confirmed": True, "prior_model": prior, "inlier_point3D_ids": ids[:-1] if mode == "registration_ids" else ids})
+                write_validation_json(output/"logs/register.log", {"status": "complete"})
+                if mode == "valid":
+                    actual, registration, frozen, handoff = load_confirmed_handoff(output)
+                    self.assertEqual(actual["lambda_map"], 1.)
+                    np.testing.assert_array_equal(frozen["point_ids"], anchors["point_ids"])
+                else:
+                    with self.assertRaises(ValueError):
+                        load_confirmed_handoff(output)
 
     def test_canonical_fingerprint_survives_serialization(self):
         """Preserve exact geometry and observation identities independently of native map iteration order."""
@@ -1171,6 +1775,51 @@ class TestFormalJointOptimization(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_registered_visual_model(visual, native, registration)
 
+    def test_registered_visual_serialization_preserves_strict_handoff(self):
+        """Accept native quaternion round trips across rotations and reject real handoff changes."""
+        from joint_map.joint import check_registered_visual_model, prepare_formal_initialization
+        from joint_map.optimization import initialize_map_points
+        native, anchors, truth = create_synthetic_scene()
+        native.images[1].qvec = [0.9993436263458957, 0.033605434720501745, -0.01190332192579901, 0.006426676140319738]
+        for angles in [[45., 22., 73.], [10., -21., 161.], [95., 31., -72.]]:
+            with self.subTest(angles=angles), tempfile.TemporaryDirectory() as directory:
+                rotation = Rotation.from_euler("xyz", angles, degrees=True).as_matrix()
+                transform = (1.2, rotation, np.array([4., -2., 1.]))
+                registered = copy.deepcopy(native)
+                write_initialized_model(registered, transform, Path(directory))
+                visual = pycolmap.Reconstruction(directory)
+                lineage = initialize_map_points(registered, anchors)
+                registration = {"scale": transform[0], "rotation": rotation.tolist(), "translation_enu_m": transform[2].tolist(), "joint_map_initialization": {"lineage": lineage}}
+                check_registered_visual_model(visual, native, registration)
+                initialized, restored_lineage = prepare_formal_initialization(visual, anchors, registration)
+                np.testing.assert_array_equal(restored_lineage["initial_xyz_enu_m"], anchors["means"])
+                np.testing.assert_array_equal(initialized.images[1].qvec, visual.images[1].qvec)
+                changed_registration = copy.deepcopy(registration)
+                changed_registration["joint_map_initialization"]["lineage"]["model_fingerprint"]["poses"] = "changed"
+                with self.assertRaises(ValueError):
+                    check_registered_visual_model(visual, native, changed_registration)
+                for mode in ["quaternion", "translation", "xyz", "calibration", "pixel", "image_name", "camera_width"]:
+                    with self.subTest(change=mode):
+                        changed = copy.deepcopy(visual)
+                        image = changed.images[1]
+                        camera = changed.cameras[image.camera_id]
+                        if mode == "quaternion":
+                            image.qvec[1] += 1e-7
+                        elif mode == "translation":
+                            image.tvec[0] += 1e-7
+                        elif mode == "xyz":
+                            changed.points3D[int(anchors["point_ids"][0])].xyz[0] += 1e-7
+                        elif mode == "calibration":
+                            camera.params[0] += 1e-7
+                        elif mode == "pixel":
+                            image.points2D[0].xy[0] += 1e-7
+                        elif mode == "image_name":
+                            image.name = "changed.png"
+                        else:
+                            camera.width += 1
+                        with self.assertRaises(ValueError):
+                            check_registered_visual_model(changed, native, registration)
+
     def test_full_joint_solve_preserves_shared_variables_and_lineage(self):
         """Solve three factor families on all observations and persist no fabricated dense evidence."""
         from joint_map.joint import solve_formal_problem, save_sparse_lineage, get_formal_fingerprint, check_serialized_model
@@ -1200,6 +1849,12 @@ class TestFormalJointOptimization(unittest.TestCase):
             self.assertEqual(report["feature"]["audit"]["geometric_blocks"], 144)
             self.assertEqual(report["feature"]["audit"]["map_blocks"], 24)
             self.assertEqual(report["feature"]["audit"]["restore_blocks"], 0)
+            for stage in ["geometry", "feature"]:
+                audit = report[stage]["audit"]
+                self.assertTrue(audit["intrinsics_fixed"])
+                self.assertTrue(audit["xyz_shared_and_variable"])
+                self.assertEqual(len(audit["pose_states"]), 6)
+                self.assertTrue(all(state["pose_variable"] and state["quaternion_manifold"] and state["qvec_tangent"] == 3 for state in audit["pose_states"]))
             self.assertEqual(get_formal_fingerprint(visual), source)
             self.assertGreater(report["all_xyz_displacement_m"]["median"], 0)
             (directory/"model").mkdir()
@@ -1275,6 +1930,103 @@ class TestFormalJointOptimization(unittest.TestCase):
 
 class TestDensePreparation(unittest.TestCase):
     """Check metric transforms, native binary identities and the explicit dense branch interface."""
+    def create_workspace(self, directory, count=24):
+        """Write dynamic six-view depths and native visibility with known sparse projections."""
+        import struct
+        from joint_map.dense import write_metric_cloud
+        model, anchors, truth = create_synthetic_scene()
+        for point_id in anchors["point_ids"][count:]:
+            model.delete_point3D(int(point_id))
+        for folder in ["sparse", "images", "stereo/depth_maps", "stereo/normal_maps", "stereo/consistency_graphs"]:
+            (directory/folder).mkdir(parents=True)
+        model.write(str(directory/"sparse"))
+        xyz = np.array([point.xyz for point in model.points3D.values()])
+        points = np.zeros(len(xyz), dtype=[(key, "<f4") for key in ["x", "y", "z", "nx", "ny", "nz"]]+[(key, "u1") for key in ["red", "green", "blue"]])
+        for index, key in enumerate(["x", "y", "z"]):
+            points[key] = xyz[:, index]
+        points["nz"] = -1
+        points = write_metric_cloud(directory/"fused.ply", points, 1., np.eye(3), np.zeros(3))
+        for image in model.images.values():
+            local = xyz+image.tvec
+            pixels = np.floor(local[:, :2]/local[:, 2:]*800+[320, 240]+0.5).astype(int)
+            depth = np.full((480, 640, 1), 10., dtype="<f4")
+            depth[pixels[:, 1], pixels[:, 0], 0] = local[:, 2]
+            normals = np.zeros((480, 640, 3), dtype="<f4")
+            normals[:, :, 2] = -1
+            for folder, array in [("depth_maps", depth), ("normal_maps", normals)]:
+                header = f"640&480&{array.shape[2]}&".encode()
+                (directory/"stereo"/folder/(image.name+".geometric.bin")).write_bytes(header+array.transpose(1, 0, 2).tobytes(order="F"))
+            (directory/"stereo/consistency_graphs"/(image.name+".geometric.bin")).write_bytes(b"640&480&1&")
+            Image.new("RGB", (640, 480)).save(directory/"images"/image.name)
+        with (directory/"fused.ply.vis").open("wb") as stream:
+            stream.write(struct.pack("<Q", count))
+            for _ in range(count):
+                stream.write(struct.pack("<I6I", 6, *range(6)))
+        for name in ["patch-match.cfg", "fusion.cfg"]:
+            (directory/"stereo"/name).write_text("synthetic\n")
+        config = {"image_names": [image.name for image in model.images.values()][::-1], "dense": {"max_image_size": 640}, "update": {"max_relative_depth_error": .01}}
+        return points, config
+
+    def test_workspace_accepts_input_order_and_dynamic_point_counts(self):
+        """Accept configured image permutations and validate every known depth association."""
+        from joint_map.dense import check_dense_workspace
+        for count in [12, 24]:
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                points, config = self.create_workspace(directory, count)
+                order, checks = check_dense_workspace(directory, points, config, 2.)
+                self.assertEqual(len(order), 6)
+                self.assertTrue(all(row["depth_agreement_count"] == count for row in checks))
+                self.assertTrue(all(row["valid_normal_pixels"] == row["valid_depth_pixels"] for row in checks))
+                self.assertTrue(all(row["depth_scale_to_m"] == 2. for row in checks))
+
+    def test_workspace_rejects_invalid_depths_and_normals(self):
+        """Reject empty depth evidence and zero or nonfinite normals at valid depth pixels."""
+        from joint_map.dense import check_dense_workspace, read_depth_map
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            points, config = self.create_workspace(directory)
+            for mode in ["depth", "zero_normal", "nan_normal"]:
+                with self.subTest(mode=mode):
+                    folder = "depth_maps" if mode == "depth" else "normal_maps"
+                    path = directory/"stereo"/folder/(config["image_names"][0]+".geometric.bin")
+                    original = path.read_bytes()
+                    array = read_depth_map(path)
+                    array[:] = np.nan if mode == "nan_normal" else 0
+                    path.write_bytes(f"640&480&{array.shape[2]}&".encode()+array.transpose(1, 0, 2).tobytes(order="F"))
+                    with self.assertRaises(ValueError):
+                        check_dense_workspace(directory, points, config, 1.)
+                    path.write_bytes(original)
+
+    def test_workspace_identity_binds_native_dense_evidence(self):
+        """Detect changed images, depths, normals or visibility even when filenames stay the same."""
+        from joint_map.dense import get_dense_workspace_fingerprints
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            points, config = self.create_workspace(directory)
+            frozen = get_dense_workspace_fingerprints(directory, config["image_names"])
+            for name in ["fused.ply.vis", "images/0.png", "stereo/depth_maps/0.png.geometric.bin", "stereo/normal_maps/0.png.geometric.bin"]:
+                with self.subTest(name=name):
+                    path = directory/name
+                    original = path.read_bytes()
+                    path.write_bytes(original+b"changed")
+                    self.assertNotEqual(frozen, get_dense_workspace_fingerprints(directory, config["image_names"]))
+                    path.write_bytes(original)
+
+    def test_metric_normals_are_renormalized_and_invalid_vectors_rejected(self):
+        """Rotate and normalize finite surface directions without accepting zero or NaN normals."""
+        from joint_map.dense import write_metric_cloud
+        points = np.zeros(1, dtype=[(key, "<f4") for key in ["x", "y", "z", "nx", "ny", "nz"]]+[(key, "u1") for key in ["red", "green", "blue"]])
+        rotation = Rotation.from_euler("xyz", [10, 20, 30], degrees=True).as_matrix()
+        with tempfile.TemporaryDirectory() as directory:
+            points["nz"] = 2.
+            result = write_metric_cloud(Path(directory)/"cloud.ply", points, 3., rotation, np.zeros(3))
+            np.testing.assert_allclose([result[key][0] for key in ["nx", "ny", "nz"]], rotation[:, 2], atol=1e-15, rtol=0)
+            for value in [0., np.nan]:
+                points["nz"] = value
+                with self.assertRaises(ValueError):
+                    write_metric_cloud(Path(directory)/"cloud.ply", points, 3., rotation, np.zeros(3))
+
     def test_metric_cloud_preserves_order_normals_and_color(self):
         """Apply Sim(3) only to XYZ and rotation only to normals with exact RGB identity."""
         from joint_map.dense import write_metric_cloud, read_fused_cloud
@@ -1288,7 +2040,8 @@ class TestDensePreparation(unittest.TestCase):
             restored = read_fused_cloud(path)
         np.testing.assert_array_equal(restored, result)
         np.testing.assert_array_equal(np.column_stack([result[key] for key in ["x", "y", "z"]]), 2*np.array([[1, 2, 3], [-4, 5, 6]])@rotation.T+translation)
-        np.testing.assert_array_equal(np.column_stack([result[key] for key in ["nx", "ny", "nz"]]), np.array([[0, 0, 1], [1, 0, 0]])@rotation.T)
+        normals = np.array([[0, 0, 1], [1, 0, 0]])@rotation.T
+        np.testing.assert_array_equal(np.column_stack([result[key] for key in ["nx", "ny", "nz"]]), normals/np.linalg.norm(normals, axis=1)[:, None])
         for key in ["red", "green", "blue"]:
             np.testing.assert_array_equal(result[key], points[key])
 
@@ -1417,16 +2170,71 @@ class TestDsmUpdate(unittest.TestCase):
             for _ in range(3):
                 stream.write(struct.pack("<I6I", 6, *range(6)))
         write_json(dense/"image_order.json", {"images": read_image_order(dense/"sparse"), "images_bin_sha256": get_sha256(dense/"sparse/images.bin")})
-        np.savez_compressed(out/"shared/map_priors.npz", shared_point_ids=np.array(ids), means_enu_m=positions, prior_ids=np.arange(3))
+        scales = dict(TestFormalJointOptimization().get_scales(), robust_loss={"name": "huber", "normalized_threshold": 3.})
+        covariance = np.diag([scales["sigma_horizontal_m"]**2]*2+[scales["sigma_height_m"]**2])
+        np.savez_compressed(out/"shared/map_priors.npz", shared_point_ids=np.array(ids), means_enu_m=positions, prior_ids=np.arange(3), covariances_m2=np.broadcast_to(covariance, (3, 3, 3)), observation_image_ids=np.repeat(np.arange(1, 7), 3))
+        np.savez(out/"shared/training_references.npz", descriptors=np.zeros((3, 128)))
+        write_json(out/"shared/run.json", {"frozen_files": {str(out/"shared"/name): get_sha256(out/"shared"/name) for name in ["map_priors.npz", "training_references.npz"]}})
+        write_json(out/"shared/prior_validation.json", {"status": "complete", "candidates": [{"candidate_id": "weight_1p0", "status": "passed", "information_scale": 1.}], "policy_sha256": "synthetic", "run_dir": str(out/"shared"), "scales": scales, "map_prior_scope": "training_frozen", "accepted_track_count": 3, "training_observation_count": 18, "heldout_observation_count": 0})
+        prior = dict(scales, status="confirmed", candidate_id="weight_1p0", user_confirmation="synthetic fixture", map_prior_scope="training_frozen", policy_sha256="synthetic")
+        for field, name in [("validation_sha256", "prior_validation.json"), ("map_priors_sha256", "map_priors.npz"), ("reference_sha256", "training_references.npz")]:
+            prior[field] = get_sha256(out/"shared"/name)
+        write_json(out/"shared/prior_model.json", prior)
+        write_json(out/"shared/registration.json", {"status": "confirmed", "priors_confirmed": True, "prior_model": prior, "inlier_point3D_ids": ids})
+        write_json(out/"logs/register.log", {"status": "complete"})
         write_json(out/"shared/origin.json", create_origin(112.99, 28.29, 70))
+        write_json(out/"logs/check.log", {"origin": json.loads((out/"shared/origin.json").read_text())})
         original = np.full((3, 3), 72., dtype=np.float32)
         original[0, 0] = -9999
         transform = Affine(1e-4, 0, 112.99-1.5e-4, 0, -1e-4, 28.29+1.5e-4)
         with rasterio.open(root/"dsm.tif", "w", driver="GTiff", width=3, height=3, count=1, dtype="float32", crs="EPSG:4326", transform=transform, nodata=-9999) as output:
             output.write(original, 1)
         report = {"status": "complete", "dense_points": 3, "source_model_sha256": {name: get_sha256(out/"baseline/model"/name) for name in ["cameras.bin", "images.bin", "points3D.bin"]}, "output_sha256": {name: get_sha256(dense/name) for name in ["fused_metric.ply", "fused_metric.ply.vis", "image_order.json"]}, "workspace_path": str(dense), "image_order_path": str(dense/"image_order.json"), "depth_scale_to_m": 1.}
+        report["workspace_sha256"] = {str(path.relative_to(dense)): get_sha256(path) for folder in ["sparse", "stereo/depth_maps", "stereo/normal_maps"] for path in (dense/folder).glob("*.bin")}
+        report["input_identity"] = {"registration_sha256": get_sha256(out/"shared/registration.json")}
         write_json(dense/"summary.json", report)
         return out, {"dsm_path": "dsm.tif", "update": self.get_limits()}, original, model, views
+
+    def change_fixture_normal_evidence(self, out):
+        """Freeze new finite unit normals that deliberately disagree with the fused surface directions."""
+        from joint_map.optimization import get_sha256
+        from run_joint_map import write_json
+        dense = out/"baseline/dense"
+        report = json.loads((dense/"summary.json").read_text())
+        normals = np.zeros((101, 101, 3), dtype="<f4")
+        normals[:, :, 0] = 1.
+        for path in (dense/"stereo/normal_maps").glob("*.bin"):
+            path.write_bytes(b"101&101&3&"+normals.transpose(1, 0, 2).tobytes(order="F"))
+            report["workspace_sha256"][str(path.relative_to(dense))] = get_sha256(path)
+        write_json(dense/"summary.json", report)
+
+    def test_update_rejects_modified_frozen_depth_and_normal_inputs(self):
+        """Reject same-name changed MVS evidence before point filtering or writing DSM results."""
+        from unittest.mock import patch
+        from joint_map.dsm import run_dsm_update
+        from run_joint_map import write_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            out, config, original, model, views = self.create_fixture(root)
+            for folder in ["depth_maps", "normal_maps"]:
+                with self.subTest(folder=folder):
+                    path = out/"baseline/dense/stereo"/folder/"0.png.geometric.bin"
+                    contents = path.read_bytes()
+                    path.write_bytes(contents+b"changed")
+                    with patch("joint_map.dsm.check_point_reliability") as check, self.assertRaisesRegex(ValueError, "Frozen MVS workspace"):
+                        run_dsm_update(config, root, out, "baseline", write_json)
+                    check.assert_not_called()
+                    self.assertFalse((out/"baseline/map/updated_dsm.tif").exists())
+                    path.write_bytes(contents)
+
+    def test_supported_nodata_cells_are_filled_without_touching_other_cells(self):
+        """Allow new reliable observations to replace old NoData only within the final evidence mask."""
+        from joint_map.dsm import build_dsm_update
+        original = np.array([[-9999., -9999.], [7., 8.]], dtype=np.float32)
+        result = build_dsm_update(original, np.zeros((3, 2), dtype=int), np.array([10., 10.1, 10.2]), {"visible_support": np.ones((3, 3), dtype=bool), "reliable": np.ones(3, dtype=bool)}, np.zeros((2, 2), dtype=bool), self.get_limits())
+        np.testing.assert_array_equal(result["update_mask"], [[True, False], [False, False]])
+        self.assertAlmostEqual(result["updated"][0, 0], 10.1, places=5)
+        np.testing.assert_array_equal(result["updated"][~result["update_mask"]], original[~result["update_mask"]])
 
     def test_height_layers_use_fixed_gap_and_reason_priority(self):
         """Reject supported layers before undersupported groups even when raw MAD is zero."""
@@ -1580,8 +2388,7 @@ class TestDsmUpdate(unittest.TestCase):
                 self.assertEqual(output.nodata, -9999)
                 self.assertEqual(written[0, 0], -9999)
                 self.assertAlmostEqual(written[1, 1], 80., places=5)
-            for path in (out/"baseline/dense/stereo/normal_maps").glob("*.bin"):
-                path.write_bytes(b"101&101&3&"+np.zeros(101*101*3, dtype="<f4").tobytes())
+            self.change_fixture_normal_evidence(out)
             report = run_dsm_update(config, root, out, "baseline", write_json)
             self.assertEqual(report["status"], "complete")
             self.assertEqual(report["update_status"], "no_valid_update")
@@ -1638,7 +2445,7 @@ class TestGeographicExport(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 check_geographic_cloud(path, positions+np.array([.1, 0, 0]), colors, origin)
             raw = path.read_bytes()
-            for corrupted in [raw.replace(b"property double x", b"property float x"), raw.replace(b"EPSG:4326", b"EPSG:4978"), raw[:-1]]:
+            for corrupted in [raw.replace(b"property double x", b"property float x"), raw.replace(b"EPSG:4326", b"EPSG:4978"), raw[:-1], raw+b"x", raw+b"trailing bytes"]:
                 path.write_bytes(corrupted)
                 with self.assertRaises(ValueError):
                     read_geographic_cloud(path)
@@ -1686,8 +2493,7 @@ class TestGeographicExport(unittest.TestCase):
                 out, config, original, model, views = TestDsmUpdate().create_fixture(root)
                 config["image_names"] = sorted(image.name for image in model.images.values())
                 if empty:
-                    for path in (out/"baseline/dense/stereo/normal_maps").glob("*.bin"):
-                        path.write_bytes(b"101&101&3&"+np.zeros(101*101*3, dtype="<f4").tobytes())
+                    TestDsmUpdate().change_fixture_normal_evidence(out)
                 update = run_dsm_update(config, root, out, "baseline", write_json)
                 report = run_geographic_export(config, root, out, "baseline", write_json)
                 self.assertEqual(report["status"], "complete")
@@ -1714,6 +2520,34 @@ class TestGeographicExport(unittest.TestCase):
             dispatch.assert_called_once_with((PROJECT_ROOT/"configs/joint_map.json").resolve(), "export", branch)
         with patch("sys.argv", ["run_joint_map.py", "--config", "configs/joint_map.json", "--stage", "export"]), patch("sys.stderr"), self.assertRaises(SystemExit):
             run_main()
+
+    def test_export_rejects_changed_origin_frozen_evidence_and_confirmation(self):
+        """Reject changed coordinate origins, MVS evidence and prior admission before creating products."""
+        from joint_map.dsm import run_dsm_update
+        from joint_map.export import run_geographic_export
+        from run_joint_map import write_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            out, config, original, model, views = TestDsmUpdate().create_fixture(root)
+            config["image_names"] = [image.name for image in model.images.values()][::-1]
+            run_dsm_update(config, root, out, "baseline", write_json)
+            for mode in ["origin", "depth", "confirmation"]:
+                with self.subTest(mode=mode):
+                    path = out/({"origin": "shared/origin.json", "depth": "baseline/dense/stereo/depth_maps/0.png.geometric.bin", "confirmation": "shared/prior_model.json"}[mode])
+                    contents = path.read_bytes()
+                    if mode == "depth":
+                        path.write_bytes(contents+b"changed")
+                    else:
+                        data = json.loads(contents)
+                        if mode == "origin":
+                            data["ecef_origin_m"][0] += 1.
+                        else:
+                            data["status"] = "validated"
+                        write_json(path, data)
+                    with self.assertRaises(ValueError):
+                        run_geographic_export(config, root, out, "baseline", write_json)
+                    self.assertFalse((out/"baseline/export/poses_wgs84.txt").exists())
+                    path.write_bytes(contents)
 
 class TestGroundTruthEvaluation(unittest.TestCase):
     """Check exact GT validity, fixed-domain scoring, paired diagnostics and baseline-first freezing."""
@@ -1892,6 +2726,37 @@ class TestGroundTruthEvaluation(unittest.TestCase):
             self.assertEqual(values.shape, (148,))
             self.assertTrue(np.isnan(values).all())
 
+    def test_evaluation_rejects_conflicting_or_changed_shared_inputs(self):
+        """Never overwrite a branch's frozen origin or DSM hash with another branch or current bytes."""
+        from unittest.mock import patch
+        from joint_map.evaluation import run_evaluation
+        from joint_map.optimization import get_sha256
+        from run_joint_map import write_json
+        for mode in ["branches", "origin", "original_dsm"]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config, evaluation_path, config_path, out = self.create_fixture(root)
+                source = root/"original.tif" if mode == "original_dsm" else out/"shared/origin.json"
+                frozen = get_sha256(source)
+                for branch in ["baseline", "joint"]:
+                    path = out/branch/"export/summary.json"
+                    metadata = json.loads(path.read_text())
+                    metadata["input_sha256"][str(source)] = "0"*64 if mode == "branches" and branch == "joint" else frozen
+                    write_json(path, metadata)
+                if mode == "origin":
+                    origin = json.loads(source.read_text())
+                    origin["ecef_origin_m"][0] += 1.
+                    write_json(source, origin)
+                elif mode == "original_dsm":
+                    with rasterio.open(source, "r+") as dataset:
+                        values = dataset.read(1)
+                        values[0, 0] += 1.
+                        dataset.write(values, 1)
+                with patch("joint_map.evaluation.stream_baseline_references") as score, self.assertRaisesRegex(ValueError, "Conflicting frozen evaluation source"):
+                    run_evaluation(config, evaluation_path, config_path, root, out, write_json)
+                score.assert_not_called()
+                self.assertFalse((out/"evaluation/baseline_metrics.json").exists())
+
     def test_evaluation_config_cannot_enter_reconstruction_stages(self):
         """Expose the isolated evaluation entry and reject evaluation data on reconstruction invocations."""
         from unittest.mock import patch
@@ -1978,6 +2843,30 @@ class TestPipelineIntegration(unittest.TestCase):
             stages.assert_not_called()
             self.assertFalse(evaluation_path.exists())
             self.assertIn("Confirm an eligible prior", json.loads((out/"logs/all.log").read_text())["error"])
+
+    def test_fresh_pipeline_prepares_validation_before_confirmation(self):
+        """Start at check without prior artifacts and stop after validation before opening GT inputs."""
+        from unittest.mock import patch
+        from run_joint_map import run_all, PIPELINE_STAGES, write_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path, out = self.create_fixture(root, [])
+            (out/"shared/prior_model.json").unlink()
+            calls = []
+            def complete_stage(path, stage="check", branch=None):
+                """Create only the simulated artifact produced by each authorized preparation stage."""
+                calls.append((stage, branch))
+                manifest = json.loads((out/"run_manifest.json").read_text())
+                manifest["stages"].append({"stage": stage, "branch": branch, "status": "complete"})
+                write_json(out/"run_manifest.json", manifest)
+                if stage == "validate_priors":
+                    write_json(out/"shared/prior_model.json", {"status": "validated"})
+            evaluation_path = root/"must_not_be_read.json"
+            with patch("run_joint_map.PROJECT_ROOT", root), patch("run_joint_map.check_environment"), patch("run_joint_map.run_check", side_effect=complete_stage), patch("run_joint_map.run_map_stage", side_effect=complete_stage), self.assertRaisesRegex(ValueError, "Confirm an eligible prior"):
+                run_all(config_path, evaluation_path)
+            self.assertEqual(calls, PIPELINE_STAGES[:4])
+            self.assertFalse(evaluation_path.exists())
+            self.assertEqual(len(json.loads((out/"logs/all.log").read_text())["executed_stages"]), 4)
 
     def test_individual_reconstruction_entries_preserve_frozen_baseline(self):
         """Block direct reconstruction and check invocations before any manifest or source mutation."""

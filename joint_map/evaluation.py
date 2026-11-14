@@ -103,7 +103,7 @@ def get_partition_statistics(errors, masks, references, profile):
 
 def collect_evaluation_inputs(config, evaluation, config_path, evaluation_path, root, output_dir):
     """Verify completed branch artifacts and fingerprint the exact six image/depth pairs before scoring."""
-    inputs = {}
+    inputs, declared = {}, []
     updates = {}
     for branch in ["baseline", "joint"]:
         export = json.loads((output_dir/branch/"export/summary.json").read_text())
@@ -111,9 +111,9 @@ def collect_evaluation_inputs(config, evaluation, config_path, evaluation_path, 
         if export["status"] != "complete" or update["status"] != "complete":
             raise ValueError("Both branches must complete update and export before evaluation")
         for name, digest in export["output_sha256"].items():
-            inputs[export["artifacts"][name]] = digest
-        inputs.update(export["input_sha256"])
-        inputs[str(output_dir/branch/"export/summary.json")] = get_sha256(output_dir/branch/"export/summary.json")
+            declared.append((export["artifacts"][name], digest))
+        declared.extend(export["input_sha256"].items())
+        declared.append((str(output_dir/branch/"export/summary.json"), get_sha256(output_dir/branch/"export/summary.json")))
         updates[branch] = update["update_status"]
     paths = [config_path, evaluation_path, Path(__file__), Path(__file__).with_name("geometry.py"), root/config["dsm_path"], output_dir/"shared/origin.json", root/evaluation["gt_pose_path"]]
     pairs = []
@@ -128,7 +128,11 @@ def collect_evaluation_inputs(config, evaluation, config_path, evaluation_path, 
             raise ValueError("GT depth must be same-resolution float32 camera-z data")
         pairs.append({"image_name": name, "image_path": str(image_path), "image_sha256": get_sha256(image_path), "depth_path": str(depth_path), "depth_sha256": get_sha256(depth_path), "shape": list(depth.shape), "dtype": str(depth.dtype)})
         paths.extend([image_path, depth_path])
-    inputs.update({str(path): get_sha256(path) for path in paths})
+    declared.extend((str(path), get_sha256(path)) for path in paths)
+    for path, digest in declared:
+        if path in inputs and inputs[path] != digest:
+            raise ValueError("Conflicting frozen evaluation source: "+path)
+        inputs[path] = digest
     for path, digest in inputs.items():
         if get_sha256(path) != digest:
             raise ValueError("Evaluation source fingerprint changed: "+path)

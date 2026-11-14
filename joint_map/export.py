@@ -6,6 +6,7 @@ import numpy as np
 import pycolmap
 from joint_map.dense import read_fused_cloud
 from joint_map.geometry import convert_enu_to_geodetic, convert_geodetic_to_enu, convert_pose_from_colmap, convert_pose_to_colmap
+from joint_map.joint import load_confirmed_handoff
 from joint_map.optimization import get_sha256
 
 def check_geographic_values(values):
@@ -59,8 +60,9 @@ def read_geographic_cloud(path):
         required = ["comment horizontal_crs EPSG:4326", "comment x longitude degrees; y latitude degrees; z ellipsoidal_height meters", "comment vertical_datum WGS84 ellipsoidal height"]
         if properties != expected or count is None or count <= 0 or not all(line in comments for line in required):
             raise ValueError("Geographic PLY precision, fields or coordinate metadata differ from the protocol")
+        data_start = stream.tell()
         values = np.fromfile(stream, dtype=[(key, "<f8") for key in ["x", "y", "z"]]+[(key, "u1") for key in ["red", "green", "blue"]])
-    if len(values) != count:
+    if len(values) != count or data_start+values.nbytes != Path(path).stat().st_size:
         raise ValueError("Geographic PLY point count differs from its header")
     check_geographic_values(np.column_stack([values[key] for key in ["x", "y", "z"]]))
     return values
@@ -120,6 +122,7 @@ def run_geographic_export(config, root, output_dir, branch, write_json):
     log_path = output_dir/"logs"/f"export_{branch}.log"
     report = {"schema_version": 3, "stage": "export", "branch": branch, "status": "running", "error": None, "gt_inputs_read": False}
     write_json(log_path, report)
+    prior, _, anchors, _ = load_confirmed_handoff(output_dir)
     dense_dir, map_dir, model_dir = [output_dir/branch/name for name in ["dense", "map", "model"]]
     dense = json.loads((dense_dir/"summary.json").read_text())
     update = json.loads((map_dir/"summary.json").read_text())
@@ -133,7 +136,8 @@ def run_geographic_export(config, root, output_dir, branch, write_json):
     inputs = {str(model_dir/name): digest for name, digest in dense["source_model_sha256"].items()}
     inputs.update({str(dense_dir/name): digest for name, digest in dense["output_sha256"].items()})
     inputs.update({str(update["artifacts"][name]): digest for name, digest in update["output_sha256"].items()})
-    for path in [output_dir/"shared/origin.json", dense_dir/"summary.json", map_dir/"summary.json"]:
+    inputs.update(update["frozen_input_sha256"])
+    for path in [output_dir/"shared/origin.json", output_dir/"logs/check.log", dense_dir/"summary.json", map_dir/"summary.json"]:
         inputs[str(path)] = get_sha256(path)
     for path, digest in inputs.items():
         if get_sha256(path) != digest:
@@ -142,10 +146,12 @@ def run_geographic_export(config, root, output_dir, branch, write_json):
     if available < 512*1024**2 or shutil.disk_usage(folder).free < 2*(dense_dir/"fused_metric.ply").stat().st_size+1024**2:
         raise RuntimeError("Insufficient resources for complete double-precision geographic export")
     origin = json.loads((output_dir/"shared/origin.json").read_text())
+    if origin != json.loads((output_dir/"logs/check.log").read_text())["origin"]:
+        raise ValueError("Geographic export origin differs from the frozen input check")
     model = pycolmap.Reconstruction(str(model_dir))
     names = config["image_names"]
     policy = {"horizontal_crs": "EPSG:4326", "height_datum": "WGS84_ellipsoidal", "xyz_order": ["longitude_deg", "latitude_deg", "ellipsoidal_height_m"], "pose_columns": ["image_name", "longitude_deg", "latitude_deg", "ellipsoidal_height_m", "roll_deg", "pitch_deg", "yaw_deg"], "pose_convention": "pitch=0 is nadir; xyz Euler uses [pitch,roll,yaw] at each camera's geographic ENU basis", "pose_decimal_places": 17, "cloud_xyz_storage": "float64", "sparse_point_order": "ascending COLMAP point3D_id", "dense_point_scope": "all native fused points in unchanged fused_metric.ply order", "coordinate_roundtrip_tolerance_m": 1e-6, "rotation_matrix_roundtrip_tolerance": 1e-10, "verification_scope": "coordinate and serialization correctness; not GT accuracy"}
-    report.update(policy=policy, input_sha256=inputs, source_update_status=update["update_status"], dsm_update_goal_complete=update["dsm_update_goal_complete"], resources={"memory_available_bytes": available, "disk_free_bytes": shutil.disk_usage(folder).free})
+    report.update(policy=policy, input_sha256=inputs, map_prior_count=len(anchors["point_ids"]), lambda_map=prior["lambda_map"], source_update_status=update["update_status"], dsm_update_goal_complete=update["dsm_update_goal_complete"], resources={"memory_available_bytes": available, "disk_free_bytes": shutil.disk_usage(folder).free})
     write_json(log_path, report)
     pose_check = export_geographic_poses(folder/"poses_wgs84.txt", model, names, origin)
     point_ids = sorted(model.points3D)

@@ -11,16 +11,16 @@
   },
   "dom_path": "datasets/maps/dom.tif",
   "dsm_path": "datasets/maps/dsm.tif",
-  "native_sfm_dir": "outputs/original_pixsfm_20261108/sfm",
-  "native_dense_dir": "outputs/original_pixsfm_20261108/dense",
+  "native_sfm_dir": "/media/amax/PS2000/pixelsfm/outputs/new_data_20261110/original_pixsfm/sfm",
+  "native_dense_dir": "/media/amax/PS2000/pixelsfm/outputs/new_data_20261110/original_pixsfm/dense",
   "initialization": "reuse_registered_sfm",
   "frontend": {
-    "features_path": "outputs/original_pixsfm_20261108/keypoints.h5",
-    "adjusted_features_path": "outputs/original_pixsfm_20261108/sfm/refined_keypoints.h5",
-    "matches_path": "outputs/original_pixsfm_20261108/matches.h5"
+    "features_path": "/media/amax/PS2000/pixelsfm/outputs/new_data_20261110/original_pixsfm/keypoints.h5",
+    "adjusted_features_path": "/media/amax/PS2000/pixelsfm/outputs/new_data_20261110/original_pixsfm/sfm/refined_keypoints.h5",
+    "matches_path": "/media/amax/PS2000/pixelsfm/outputs/new_data_20261110/original_pixsfm/matches.h5"
   },
   "colmap_binary": "build/colmap_cuda/install_ptx90/bin/colmap",
-  "output_dir": "outputs/joint_map",
+  "output_dir": "/media/amax/PS2000/pixelsfm/outputs/redevelopment_20261113/joint_map",
   "map_association": {
     "min_tracks": 12,
     "matcher": "superglue",
@@ -35,7 +35,7 @@
     "candidate_information_scales": [0.1, 1.0, 10.0],
     "holdout_fraction": 0.2,
     "holdout_seed": 0,
-    "selected_model_path": "outputs/joint_map/shared/prior_model.json"
+    "selected_model_path": "/media/amax/PS2000/pixelsfm/outputs/redevelopment_20261113/joint_map/shared/prior_model.json"
   },
   "dense": {"max_image_size": 2000},
   "optimization": {"use_inner_iterations": false},

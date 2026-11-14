@@ -30,11 +30,13 @@ def get_file_fingerprint(path):
 
 def check_config(config):
     """Validate the fixed reconstruction protocol and reject evaluation fields."""
-    expected = {"model": "PINHOLE", "width": 3840, "height": 2160, "params": [2700.0, 2700.0, 1920.0, 1080.0], "fixed": True}
-    if config["schema_version"] != 3 or config["camera"] != expected:
-        raise ValueError("Expected schema v3 and the planned fixed PINHOLE camera")
-    if config["image_names"] != [f"{index}_0.png" for index in range(6)]:
-        raise ValueError("Expected the six planned images in fixed order")
+    camera = config["camera"]
+    params = np.asarray(camera["params"], dtype=np.float64)
+    if config["schema_version"] != 3 or camera["model"] != "PINHOLE" or (camera["width"], camera["height"]) != (3840, 2160) or camera["fixed"] is not True or params.shape != (4,) or not np.isfinite(params).all() or np.any(params[:2] <= 0):
+        raise ValueError("Expected schema v3 and fixed PINHOLE fx/fy/cx/cy with finite positive focal lengths")
+    names = config["image_names"]
+    if not isinstance(names, list) or len(names) != 6 or any(not isinstance(name, str) or not name.strip() or Path(name).is_absolute() or ".." in Path(name).parts for name in names) or len(set(names)) != 6:
+        raise ValueError("Expected six unique relative image names in the configured order")
     pending = [config]
     while pending:
         value = pending.pop()
@@ -63,10 +65,20 @@ def check_inputs(config):
     paths.extend(PROJECT_ROOT / value for value in config["frontend"].values())
     paths.extend(PROJECT_ROOT / config["native_sfm_dir"] / name for name in ["cameras.bin", "images.bin", "points3D.bin"])
     paths.extend(PROJECT_ROOT / config["native_dense_dir"] / name for name in ["fused.ply", "fused.ply.vis"])
-    for path in paths:
+    provenance_path = (PROJECT_ROOT / config["native_sfm_dir"]).parent / "run_config.json"
+    paths.append(provenance_path)
+    for path in map(Path.resolve, paths):
         if not path.is_file():
             raise FileNotFoundError(path)
-        fingerprints[str(path.relative_to(PROJECT_ROOT))] = get_file_fingerprint(path)
+        fingerprints[str(path)] = get_file_fingerprint(path)
+    provenance = json.loads(provenance_path.read_text())
+    if sorted(provenance["image_names"]) != sorted(config["image_names"]):
+        raise ValueError("Native provenance image names differ from the configured inputs")
+    for name in config["image_names"]:
+        recorded_path = Path(provenance["image_dir"]) / name
+        actual_path = (PROJECT_ROOT / config["image_dir"] / name).resolve()
+        if provenance["input_sha256"].get(str(recorded_path)) != fingerprints[str(actual_path)]["sha256"]:
+            raise ValueError(f"Native provenance image hash mismatch: {name}")
     if not os.access(PROJECT_ROOT / config["colmap_binary"], os.X_OK):
         raise ValueError("The planned COLMAP binary is not executable")
     camera = config["camera"]
@@ -78,8 +90,8 @@ def check_inputs(config):
     with rasterio.open(PROJECT_ROOT / config["dom_path"]) as dom, rasterio.open(PROJECT_ROOT / config["dsm_path"]) as dsm:
         if dom.crs != rasterio.crs.CRS.from_epsg(4326) or dsm.crs != dom.crs:
             raise ValueError("Both maps must have the planned EPSG:4326 horizontal CRS")
-        if dom.shape != (395, 404) or dsm.shape != dom.shape or dsm.transform != dom.transform:
-            raise ValueError("Expected the planned common 395 by 404 map grid")
+        if min(dsm.shape) < 2 or dsm.shape != dom.shape or dsm.transform != dom.transform or not np.isfinite(list(dsm.transform)).all() or dsm.transform.determinant == 0:
+            raise ValueError("DOM and DSM must share a finite invertible grid with at least two rows and columns")
         if dom.count != 3 or dom.dtypes != ("int16",) * 3 or dom.nodata != 255:
             raise ValueError("Unexpected DOM bands, data type or NoData")
         if dsm.count != 1 or dsm.dtypes != ("float32",) or dsm.nodata != -9999:
@@ -93,12 +105,12 @@ def check_inputs(config):
         origin = create_origin(longitude, latitude, np.median(heights.data[valid]))
         maps = {"crs": str(dsm.crs), "height_datum": "WGS84_ellipsoidal", "height_datum_basis": "user_agreement", "shape": list(dsm.shape), "transform": list(dsm.transform), "valid_dsm_pixels": int(valid.sum()), "dom_nodata": dom.nodata, "dsm_nodata": dsm.nodata}
     model = pycolmap.Reconstruction(str(PROJECT_ROOT / config["native_sfm_dir"]))
-    if sorted(image.name for image in model.images.values()) != config["image_names"]:
-        raise ValueError("Native model must contain exactly the six planned registered images")
+    if model.num_reg_images() != len(config["image_names"]) or sorted(image.name for image in model.images.values()) != sorted(config["image_names"]) or model.num_points3D() == 0:
+        raise ValueError("Native model must contain all six configured registered images and nonempty sparse points")
     for native_camera in model.cameras.values():
         if native_camera.model_name != camera["model"] or (native_camera.width, native_camera.height) != (camera["width"], camera["height"]) or not np.array_equal(native_camera.params, camera["params"]):
             raise ValueError("Native model intrinsics differ from the fixed input camera")
-    return origin, {"input_fingerprints": fingerprints, "camera": camera, "maps": maps, "registered_images": model.num_reg_images(), "sparse_points": model.num_points3D()}
+    return origin, {"input_fingerprints": fingerprints, "native_input_identity": {"provenance_path": str(provenance_path.resolve()), "matched_image_count": len(config["image_names"])}, "image_names": config["image_names"], "camera": camera, "maps": maps, "registered_images": model.num_reg_images(), "sparse_points": model.num_points3D()}
 
 def run_check(config_path):
     """Run module one and mark complete only after all input checks succeed."""
@@ -108,6 +120,13 @@ def run_check(config_path):
     output_dir = PROJECT_ROOT / config["output_dir"]
     if (output_dir/"evaluation/baseline_metrics.json").is_file():
         raise ValueError("GT baseline is frozen; use --stage all to verify this experiment instead of rebuilding check")
+    if (PROJECT_ROOT / config["prior_validation"]["selected_model_path"]).resolve() != (output_dir/"shared/prior_model.json").resolve():
+        raise ValueError("Selected prior model must belong to this output directory")
+    log_path = output_dir / "logs/check.log"
+    if log_path.is_file():
+        previous = json.loads(log_path.read_text())
+        if previous["config"]["sha256"] != get_file_fingerprint(config_path)["sha256"] or any(get_file_fingerprint(Path(saved["path"])) != saved for saved in previous["input_fingerprints"].values()):
+            raise ValueError("Inputs or configuration changed; preserve this run and use an independent output directory")
     manifest_path = output_dir / "run_manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {"schema_version": 3, "stages": []}
     for record in manifest["stages"]:
@@ -119,7 +138,6 @@ def run_check(config_path):
     write_json(manifest_path, manifest)
     origin, report = check_inputs(config)
     origin_path = output_dir / "shared/origin.json"
-    log_path = output_dir / "logs/check.log"
     report.update(schema_version=3, stage="check", status="complete", environment=environment, config=manifest["config"], origin=origin, gt_inputs_read=False)
     write_json(origin_path, origin)
     write_json(log_path, report)
@@ -302,7 +320,7 @@ def audit_pipeline(config_path, evaluation_config_path, output_dir):
         original, profile = source.read(1), source.profile
     for branch in ["baseline", "joint"]:
         model = pycolmap.Reconstruction(str(output_dir/branch/"model"))
-        if model.num_reg_images() != 6 or sorted(image.name for image in model.images.values()) != config["image_names"]:
+        if model.num_reg_images() != len(config["image_names"]) or sorted(image.name for image in model.images.values()) != sorted(config["image_names"]):
             raise ValueError("Branch camera identities are incomplete")
         for camera in model.cameras.values():
             if camera.model_name != config["camera"]["model"] or (camera.width, camera.height) != (config["camera"]["width"], config["camera"]["height"]):

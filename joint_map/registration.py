@@ -1,5 +1,6 @@
 # 用途：建立同特征索引的 DOM 关联并独立检验地图 Sim(3) 初始化。
 import itertools
+import hashlib
 import json
 import cv2
 import h5py
@@ -47,6 +48,8 @@ def check_feature_identity(model, feature_path, adjusted_path):
             descriptors = group["descriptors"][:].astype(np.float32)
             if not np.isfinite(descriptors).all() or not np.allclose(np.linalg.norm(descriptors, axis=0), 1, atol=0.002):
                 raise ValueError(f"Invalid original descriptors: {image.name}")
+            if group["keypoints"].shape != (count, 2) or adjusted[image.name]["keypoints"].shape != (count, 2) or not np.isfinite(group["keypoints"][:]).all() or not np.isfinite(group["scores"][:]).all():
+                raise ValueError(f"Invalid original feature coordinates or scores: {image.name}")
             expected = (adjusted[image.name]["keypoints"][:] + 0.5).astype(np.float32)
             actual = np.array([point.xy for point in observations[image_id]])
             if not np.array_equal(actual, expected):
@@ -80,18 +83,21 @@ def check_camera_connectivity(model, anchor_ids):
 def check_track_geometry(model, observations, point_id, max_error_px, min_angle_deg):
     """Check positive depths, full-track reprojection and multiview triangulation angle."""
     point = model.points3D[int(point_id)]
+    if not np.isfinite(point.xyz).all():
+        return False
     centers, errors = [], []
     for entry in point.track.elements:
         image = model.images[entry.image_id]
         camera = model.cameras[image.camera_id]
         xyz_camera = image.rotmat() @ point.xyz + image.tvec
-        if xyz_camera[2] <= 0:
+        measured = observations[entry.image_id][entry.point2D_idx].xy
+        if not np.isfinite(xyz_camera).all() or xyz_camera[2] <= 0 or not np.isfinite(measured).all():
             return False
         fx, fy, cx, cy = camera.params
         predicted = xyz_camera[:2] / xyz_camera[2] * [fx, fy] + [cx, cy]
-        errors.append(np.linalg.norm(predicted - observations[entry.image_id][entry.point2D_idx].xy))
+        errors.append(np.linalg.norm(predicted - measured))
         centers.append(-image.rotmat().T @ image.tvec)
-    if len(centers) < 2 or max(errors) > max_error_px:
+    if len(centers) < 2 or not np.isfinite(errors).all() or max(errors) > max_error_px:
         return False
     rays = point.xyz - np.asarray(centers)
     rays /= np.linalg.norm(rays, axis=1, keepdims=True)
@@ -161,6 +167,7 @@ def screen_homography(image_pixels, dom_pixels, threshold_px):
     errors = np.full(len(image_pixels), np.inf)
     if len(image_pixels) < 4:
         return errors, None
+    cv2.setRNGSeed(0)
     matrix, mask = cv2.findHomography(np.asarray(image_pixels, dtype=np.float64), np.asarray(dom_pixels, dtype=np.float64), cv2.RANSAC, threshold_px)
     if matrix is not None:
         predicted = transform_pixels(image_pixels, matrix)
@@ -217,6 +224,31 @@ def select_map_candidates(links, source_xyz, threshold_m):
         selected.append(passed[np.argmax(links["scores"][passed])])
     return accepted, codes, residuals, reference_counts, np.asarray(selected, dtype=int), validation_models
 
+def filter_common_registration(links, source_xyz, selected, threshold_m, min_tracks):
+    """Reject common-map outliers monotonically and refit until every retained anchor passes."""
+    selected = np.asarray(selected, dtype=np.int64).copy()
+    initial_ids = links["track_ids"][selected].tolist()
+    report = {"policy": "monotone_common_sim3_v1", "status": "failed", "threshold_m": threshold_m, "initial_point_ids": initial_ids, "initial_selected_link_indices": selected.tolist(), "steps": [], "selected_point_ids": [], "selected_link_indices": [], "outlier_point_ids": [], "errors_m": None, "inlier_count": 0, "error": None}
+    while len(selected) >= min_tracks:
+        source, means = source_xyz[selected], links["means_enu_m"][selected]
+        transform = estimate_sim3(source, means, threshold_m)[0] if not report["steps"] else fit_sim3(source, means)
+        if transform is None:
+            report["error"] = "Common map anchors are degenerate or have no positive-scale transform"
+            break
+        errors = np.linalg.norm(apply_sim3(source, transform)-means, axis=1)
+        passed = np.isfinite(errors) & (errors <= threshold_m)
+        point_ids = links["track_ids"][selected]
+        report["steps"].append({"iteration": len(report["steps"]), "point_ids": point_ids.tolist(), "selected_link_indices": selected.tolist(), "errors_m": [float(error) if np.isfinite(error) else None for error in errors], "rejected_point_ids": point_ids[~passed].tolist(), "inlier_count": int(passed.sum()), "transform": {"scale": float(transform[0]), "rotation": transform[1].tolist(), "translation_enu_m": transform[2].tolist()}})
+        report["outlier_point_ids"].extend(point_ids[~passed].tolist())
+        if passed.all():
+            report.update(status="complete", selected_point_ids=point_ids.tolist(), selected_link_indices=selected.tolist(), errors_m=errors.tolist(), inlier_count=len(selected))
+            return transform, selected, report
+        selected = selected[passed]
+    if report["error"] is None:
+        report["error"] = "Insufficient common map anchors after consistency filtering"
+    report.update(selected_point_ids=links["track_ids"][selected].tolist(), selected_link_indices=selected.tolist())
+    return None, selected, report
+
 def extract_dom_features(config, root, shared_dir):
     """Extract SuperPoint on the fixed DOM variants while preserving masks and resize maps."""
     if not torch.cuda.is_available():
@@ -256,7 +288,8 @@ def extract_dom_features(config, root, shared_dir):
                 group.create_dataset("image_size", data=[width, height])
                 group.create_dataset("valid_mask", data=mask.astype(np.uint8), compression="gzip")
                 variants.append({"id": len(variants), "name": name, "angle_deg": angle, "scale": scale, "original_to_variant": matrix.tolist(), "variant_to_original": np.linalg.inv(matrix).tolist(), "network_to_variant": [[ratios[0], 0, (ratios[0] - 1) / 2], [0, ratios[1], (ratios[1] - 1) / 2], [0, 0, 1]], "image_size": [width, height], "network_size": list(size), "valid_mask": f"dom_features.h5:{name}/valid_mask", "feature_count": int(support.sum())})
-                print(f"DOM features {len(variants)}/36: {name}, points={support.sum()}", flush=True)
+                total = len(config["map_association"]["dom_rotations_deg"]) * len(config["map_association"]["dom_scales"])
+                print(f"DOM features {len(variants)}/{total}: {name}, points={support.sum()}", flush=True)
     return {"schema_version": 3, "normalization_percentiles": [1, 99], "normalization_values": [float(lower), float(upper)], "variants": variants}
 
 def match_dom_features(config, root, shared_dir, variants):
@@ -298,7 +331,7 @@ def collect_map_candidates(config, root, shared_dir, variants, model, origin):
                 dom_feature_ids = indices[feature_ids]
                 dom_pixels = transform_pixels(maps[variant["name"]]["keypoints"][:][dom_feature_ids], variant["variant_to_original"])
                 errors, matrix = screen_homography(images[name]["keypoints"][:][feature_ids], dom_pixels, config["map_association"]["homography_forward_threshold_dom_px"])
-                homographies.append({"image_name": name, "variant_id": variant["id"], "matrix_image_to_original_dom": None if matrix is None else matrix.tolist(), "matches": len(feature_ids), "coarse_inliers": int(np.sum(errors <= 3))})
+                homographies.append({"image_name": name, "variant_id": variant["id"], "matrix_image_to_original_dom": None if matrix is None else matrix.tolist(), "matches": len(feature_ids), "coarse_inliers": int(np.sum(errors <= config["map_association"]["homography_forward_threshold_dom_px"]))})
                 positions = convert_pixels_to_geodetic(dom_pixels, dsm.transform)
                 sampled, valid = sample_dsm(heights, dsm.transform, positions)
                 xyz = convert_geodetic_to_enu(np.column_stack([positions, sampled]), origin)
@@ -337,6 +370,47 @@ def write_initialized_model(model, transform, path):
     path.mkdir(parents=True, exist_ok=True)
     model.write(str(path))
 
+def check_initialized_model(source, target, transform):
+    """Verify the serialized Sim(3) preserves cameras, tracks, observations and relative geometry."""
+    if set(source.cameras) != set(target.cameras) or set(source.images) != set(target.images) or set(source.points3D) != set(target.points3D) or set(source.reg_image_ids()) != set(target.reg_image_ids()):
+        raise ValueError("Initialized model changed camera, image or shared point identities")
+    for camera_id, camera in source.cameras.items():
+        actual = target.cameras[camera_id]
+        if (camera.model_name, camera.width, camera.height) != (actual.model_name, actual.width, actual.height) or not np.array_equal(camera.params, actual.params):
+            raise ValueError("Initialized model changed fixed calibration")
+    max_camera_error, max_projection_error, observations = 0., 0., 0
+    for point_id, point in source.points3D.items():
+        actual = target.points3D[point_id]
+        if [(entry.image_id, entry.point2D_idx) for entry in point.track.elements] != [(entry.image_id, entry.point2D_idx) for entry in actual.track.elements]:
+            raise ValueError("Initialized model changed complete tracks")
+        if not np.allclose(actual.xyz, apply_sim3(point.xyz, transform), atol=1e-9, rtol=1e-10):
+            raise ValueError("Initialized shared XYZ differs from common Sim(3)")
+    for image_id, image in source.images.items():
+        actual = target.images[image_id]
+        rotation, translation = transform_colmap_pose(image.rotmat(), image.tvec, *transform)
+        if (image.name, image.camera_id) != (actual.name, actual.camera_id) or not np.allclose(actual.rotmat(), rotation, atol=1e-12, rtol=1e-12) or not np.allclose(actual.tvec, translation, atol=1e-9, rtol=1e-10):
+            raise ValueError("Initialized pose differs from common Sim(3)")
+        old_points, new_points = image.points2D, actual.points2D
+        if len(old_points) != len(new_points):
+            raise ValueError("Initialized model changed image feature rows")
+        for before, after in zip(old_points, new_points):
+            if before.point3D_id != after.point3D_id or not np.array_equal(before.xy, after.xy):
+                raise ValueError("Initialized model changed observation identity or measured pixels")
+            if not before.has_point3D():
+                continue
+            old_camera = image.rotmat() @ source.points3D[before.point3D_id].xyz + image.tvec
+            new_camera = actual.rotmat() @ target.points3D[after.point3D_id].xyz + actual.tvec
+            if not np.allclose(new_camera, transform[0]*old_camera, atol=1e-8, rtol=1e-10):
+                raise ValueError("Initialized model changed relative camera geometry")
+            params = source.cameras[image.camera_id].params
+            error = np.linalg.norm((new_camera[:2]/new_camera[2]-old_camera[:2]/old_camera[2])*params[:2])
+            if not np.isfinite(error) or error > 1e-7:
+                raise ValueError("Initialized model changed image projections")
+            max_camera_error = max(max_camera_error, float(np.max(np.abs(new_camera-transform[0]*old_camera))))
+            max_projection_error = max(max_projection_error, float(error))
+            observations += 1
+    return {"passed": True, "registered_images": target.num_reg_images(), "sparse_points": target.num_points3D(), "observations": observations, "max_camera_coordinate_error_m": max_camera_error, "max_projection_error_px": max_projection_error}
+
 def run_initialization(config, root, output_dir, write_json):
     """Build DOM links and provisional ENU models, returning explicit failure evidence."""
     shared_dir = output_dir / "shared"
@@ -349,29 +423,38 @@ def run_initialization(config, root, output_dir, write_json):
     links, source_xyz, homographies = collect_map_candidates(config, root, shared_dir, variants, model, origin)
     threshold = config["map_association"]["sim3_inlier_threshold_m"]
     accepted, codes, residuals, reference_counts, selected, validation_models = select_map_candidates(links, source_xyz, threshold)
+    independent_selected = selected.copy()
+    links.update(independent_accepted=accepted.copy(), independent_rejection_codes=codes.copy(), independent_selected_for_prior=np.zeros(len(accepted), dtype=bool))
+    links["independent_selected_for_prior"][selected] = True
+    transform, selected, common = filter_common_registration(links, source_xyz, selected, threshold, config["map_association"]["min_tracks"])
+    rejected_ids = np.setdiff1d(links["track_ids"][independent_selected], links["track_ids"][selected])
+    links["common_rejected"] = np.isin(links["track_ids"], rejected_ids)
+    codes[accepted & links["common_rejected"]] = "common_track_outlier"
+    accepted = accepted & ~links["common_rejected"]
     links.update(accepted=accepted, rejection_codes=codes, independent_errors_m=residuals, independent_reference_counts=reference_counts, selected_for_prior=np.zeros(len(accepted), dtype=bool), prior_ids=np.full(len(accepted), -1, dtype=np.int64))
-    links["selected_for_prior"][selected] = True
-    for prior_id, index in enumerate(selected):
-        links["prior_ids"][accepted & (links["track_ids"] == links["track_ids"][index])] = prior_id
+    if common["status"] == "complete":
+        links["selected_for_prior"][selected] = True
+        for prior_id, index in enumerate(selected):
+            links["prior_ids"][accepted & (links["track_ids"] == links["track_ids"][index])] = prior_id
     np.savez_compressed(shared_dir / "track_map_links.npz", **links)
     reached, connected = check_camera_connectivity(model, links["track_ids"][selected])
-    transform, inliers = estimate_sim3(source_xyz[selected], links["means_enu_m"][selected], threshold)
     report = {"schema_version": 3, "stage": "initialize", "status": "failed", "identity": identity, "candidate_count": len(accepted), "accepted_candidate_count": int(accepted.sum()), "accepted_track_count": len(selected), "single_image_dom_track_count": int(sum(len(np.unique(links["image_ids"][accepted & (links["track_ids"] == links["track_ids"][index])])) == 1 for index in selected)), "rejection_counts": {str(code): int(np.sum(codes == code)) for code in np.unique(codes)}, "homographies": homographies, "connected_image_ids": reached, "all_cameras_connected": connected, "homography_threshold_dom_px": 3., "sim3_threshold_m": threshold, "independent_validation": "track_grouped_5_fold_crossfit", "initialization_uses_heldout": True, "gt_inputs_read": False, "prior_status": "unvalidated", "error": None}
     report["independent_models"] = validation_models
-    if len(selected) < config["map_association"]["min_tracks"] or transform is None or inliers.sum() < config["map_association"]["min_tracks"] or not connected:
-        report["error"] = "Insufficient independently validated nondegenerate map anchors or disconnected cameras; no threshold relaxation or GT fallback"
-        write_json(output_dir / "logs/initialize.log", report)
-        return report
-    if not inliers.all():
-        report["error"] = "Independently accepted anchors are inconsistent under the common final Sim(3); pending review"
+    report.update(registered_images=model.num_reg_images(), sparse_points=model.num_points3D(), homography_threshold_dom_px=config["map_association"]["homography_forward_threshold_dom_px"])
+    report.update(common_registration=common, independent_accepted_track_count=len(independent_selected), common_rejected_track_count=len(rejected_ids))
+    if transform is None or not connected:
+        report["error"] = common["error"] if transform is None else "Common map anchors do not connect all cameras"
         write_json(output_dir / "logs/initialize.log", report)
         return report
     scale, rotation, translation = transform
-    registration = {"schema_version": 3, "status": "provisional", "scale": scale, "rotation": rotation.tolist(), "translation_enu_m": translation.tolist(), "inlier_point3D_ids": links["track_ids"][selected].tolist(), "independent_validation": "track_grouped_5_fold_crossfit", "priors_confirmed": False}
+    registration = {"schema_version": 3, "status": "provisional", "scale": scale, "rotation": rotation.tolist(), "translation_enu_m": translation.tolist(), "inlier_point3D_ids": links["track_ids"][selected].tolist(), "selected_link_indices": selected.tolist(), "track_map_links_sha256": hashlib.sha256((shared_dir/"track_map_links.npz").read_bytes()).hexdigest(), "map_collection_scope": "module2_common_frozen", "common_filter_policy": common["policy"], "independent_validation": "track_grouped_5_fold_crossfit", "priors_confirmed": False}
     write_json(shared_dir / "registration.json", registration)
+    report["branch_geometry"] = {}
     for branch in ["baseline", "joint"]:
         branch_model = pycolmap.Reconstruction(str(root / config["native_sfm_dir"]))
         write_initialized_model(branch_model, transform, output_dir / branch / "model")
+        restored = pycolmap.Reconstruction(str(output_dir / branch / "model"))
+        report["branch_geometry"][branch] = check_initialized_model(model, restored, transform)
     report.update(status="complete", registered_images=model.num_reg_images(), sparse_points=model.num_points3D(), scale=scale, anchor_errors_m=np.linalg.norm(apply_sim3(source_xyz[selected], transform) - links["means_enu_m"][selected], axis=1).tolist())
     write_json(shared_dir / "prior_model.json", {"schema_version": 3, "status": "unvalidated", "sigma_horizontal_m": None, "sigma_height_m": None, "sigma_pixel_px": None, "lambda_feature": None, "lambda_map": None, "robust_loss": None, "validation_report": None, "selection_basis": "Pending module three; no production covariance or weight assigned"})
     write_json(output_dir / "logs/initialize.log", report)
