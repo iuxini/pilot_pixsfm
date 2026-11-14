@@ -10,7 +10,8 @@ import numpy as np
 from PIL import Image
 import rasterio
 from rasterio.transform import from_origin
-import run_localization as entry
+from joint_map import workflow as entry
+from run_original import run_original
 
 class TestRawLocalization(unittest.TestCase):
     """Check the raw-input delivery contract without creating reusable data artifacts."""
@@ -120,16 +121,16 @@ print('Long output path tensor IPC: PASS')
         """Never start downstream stages after native preparation fails."""
         with patch.object(entry, 'check_environment'), patch.object(entry.subprocess, 'run', return_value=SimpleNamespace(returncode=7)) as process:
             with self.assertRaisesRegex(RuntimeError, 'native failed'):
-                entry.run_localization(*self.inputs, self.output, self.intrinsics)
+                run_original(*self.inputs, self.output, self.intrinsics)
         process.assert_called_once()
-        runs = list(self.output.glob('run_*'))
-        result = json.loads((runs[0]/'localization_result.json').read_text())
+        runs = list(self.output.glob('original/run_*'))
+        result = json.loads((runs[0]/'result.json').read_text())
         self.assertEqual(result['status'], 'failed')
         self.assertEqual(result['current_stage'], 'native')
         self.assertEqual(process.call_args.kwargs['env']['TMPDIR'], str(runs[0]/'cache/tmp'))
 
-    def test_each_invocation_generates_a_fresh_complete_run_without_gt(self):
-        """Exercise all internal commands twice and require disjoint outputs with no stage reuse."""
+    def test_original_invocations_are_fresh_and_never_start_improved_or_gt(self):
+        """Generate separate original runs without starting formal joint or evaluating either version."""
         calls = []
         def simulate(command, **kwargs):
             calls.append(command)
@@ -141,8 +142,8 @@ print('Long output path tensor IPC: PASS')
                 for value in config['frontend'].values():
                     self.assertTrue(Path(value).is_relative_to(output))
                 self.assertEqual(config['prior_validation']['selected_model_path'], str(output/'shared/prior_model.json'))
-                if '--stage' in command and command[command.index('--stage')+1] == 'export' and command[-1] == 'joint':
-                    folder = output/'joint/export'
+                if '--stage' in command and command[command.index('--stage')+1] == 'export' and command[-1] == 'baseline':
+                    folder = output/'baseline/export'
                     folder.mkdir(parents=True)
                     (folder/'summary.json').write_text(json.dumps({'input_sha256': {}, 'artifacts': {}, 'output_sha256': {}}))
                     (folder/'poses_wgs84.txt').write_text(''.join(name+' 113 28 100 0 0 0\n' for name in config['image_names']))
@@ -152,13 +153,15 @@ print('Long output path tensor IPC: PASS')
                 (shared/'prior_model.json').write_text(json.dumps({'candidate_id': 'weight_1p0', 'lambda_map': 1., 'selection_basis': 'automatic_no_gt_v1'}))
             return SimpleNamespace(returncode=0)
         with patch.object(entry, 'check_environment'), patch.object(entry.subprocess, 'run', side_effect=simulate), patch.object(entry, 'load_confirmed_handoff'):
-            first = entry.run_localization(*self.inputs, self.output, self.intrinsics)
-            second = entry.run_localization(*self.inputs, self.output, self.intrinsics)
+            first = run_original(*self.inputs, self.output, self.intrinsics)
+            second = run_original(*self.inputs, self.output, self.intrinsics)
         self.assertNotEqual(first['output_dir'], second['output_dir'])
-        self.assertEqual(len(calls), 28)
+        self.assertEqual(len(calls), 20)
+        self.assertFalse(any('--stage' in call and call[call.index('--stage')+1] in ['joint', 'evaluate', 'all'] for call in calls))
+        self.assertFalse(any('--branch' in call and call[-1] == 'joint' for call in calls))
         for result in [first, second]:
             self.assertEqual(result['status'], 'complete')
-            self.assertEqual(len(result['stages']), 14)
+            self.assertEqual(len(result['stages']), 10)
             self.assertEqual(len(result['poses']), 6)
             self.assertFalse(result['data_artifacts_reused'])
             self.assertFalse(result['accuracy_evaluated'])

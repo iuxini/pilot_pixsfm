@@ -1,7 +1,7 @@
 <!-- 用途：记录按PROJECT_PLAN.md执行的P4 MVP验收、真实逐阶段证据、硬编码审查与使用设置。 -->
 # P4 · MVP整体验收报告（2026-11-14）
 
-> 后续交付入口：用户新增“仅提供六张照片、DOM/DSM、输出路径和内参，每次全新生成”的要求由`run_localization.py`实现；当前用法见[USAGE_JOINT_MAP.md](USAGE_JOINT_MAP.md)。本文保留当时采用已有原版产物、手动确认及GT评价的验收证据和精度结论，逐阶段命令不再是日常定位的必需操作。
+> 当前交付入口已按用户要求分为`run_original.py`、`run_improved.py`和`evaluate_results.py`，用同批输出目录自动交接；原版重建、改进版计算和GT评价分别启动。当前用法见[USAGE_JOINT_MAP.md](USAGE_JOINT_MAP.md)。本文保留历史验收证据和精度结论，旧的合并入口已移除。
 
 **结论：工程功能与约定输入下的自动化验收通过；按计划第9.3节的总体验收未通过。** 八项精度仅4项达标，`primary_acceptance_passed=false`、`delivery_complete=false`。因此本报告不签发无条件的“【MVP验收通过】”。
 
