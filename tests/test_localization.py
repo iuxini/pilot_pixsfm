@@ -123,7 +123,7 @@ print('Long output path tensor IPC: PASS')
             with self.assertRaisesRegex(RuntimeError, 'native failed'):
                 run_original(*self.inputs, self.output, self.intrinsics)
         process.assert_called_once()
-        runs = list(self.output.glob('original/run_*'))
+        runs = list(self.output.glob('real/original/run_*'))
         result = json.loads((runs[0]/'result.json').read_text())
         self.assertEqual(result['status'], 'failed')
         self.assertEqual(result['current_stage'], 'native')
